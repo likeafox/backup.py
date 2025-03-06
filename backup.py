@@ -26,6 +26,8 @@ colours = types.SimpleNamespace(
     YELLOW = '\x1b[33m',
     GREEN = '\x1b[32m',
     RED = '\x1b[31m',
+    BLUE = '\x1b[34m',
+    BRIGHT_BLUE = '\x1b[94m',
     BRIGHT_BLACK = '\x1b[90m',
     BOLD = '\x1b[1m',
     RESET = '\x1b[0m'
@@ -81,80 +83,318 @@ class ConfigError(MyError):
     def __bool__(self):
         return bool(self.verrs)
 
-def new_config(filename):
-    try:
-        with open(filename) as f:
-            raw_config = f.read()
-    except FileNotFoundError as e:
-        err_str = f"{e.strerror}: {e.filename}"
-        raise MyError(err_str, error_code='notfound')
-    try:
-        import yaml
-        config = yaml.safe_load(raw_config)
-    except Exception as e:
-        raise MyError("yaml error", e, error_code='yaml')
+class Config():
+    PERSISTENT = ('name','user_config','raw_user_config', 'objects')
 
-    validation_errors = ConfigError()
-    class VErr(Exception): pass
-    def _inner_test(keys, strongtype=None, cat=None, validator=None):
-        x = config
-        for k in keys.split('.'):
-            try:
-                x = x[k]
-            except KeyError:
-                if cat == "group":
-                    raise VErr("Group is not defined")
-                else:
-                    raise VErr("Missing required key")
-        if strongtype not in (None, type(x)):
-            raise VErr(f"Value must be type {strongtype.__name__}, but {type(x).__name__} was found.")
-        match cat:
-            case 'snap':
-                if not re.fullmatch(r'(@[-\w]+|beginning)', x):
-                    raise VErr("Doesn't look like a snapshot name")
-            case 'word':
-                if not re.fullmatch(r'[-\w]+', x):
-                    raise VErr("Contains invalid characters")
-            case 'dataset':
-                if not re.fullmatch(r'\w[-\w]*(/?[-\w]+)*', x):
-                    raise VErr("Doesn't look like a dataset")
-        if validator is not None and not validator(x):
-            raise VErr("Failed validation")
-
-    def test(keys, *args, **kwargs):
-        nonlocal validation_errors
+    @classmethod
+    def import_(cls, filename):
         try:
-            _inner_test(keys, *args, **kwargs)
-        except VErr as e:
-            validation_errors += (keys, e.args[0])
-            return False
-        return True
+            with open(filename) as f:
+                raw_user_config = f.read()
+        except FileNotFoundError as e:
+            err_str = f"{e.strerror}: {e.filename}"
+            raise MyError(err_str, error_code='notfound')
 
-    # To truly validate things, we need to cross reference everything
-    # to real system objects (qubes, snapshots, etc.), which doesn't
-    # happen til later, so we can't be perfect here.
-    # The validation here is (mostly) to benefit the user with better
-    # error messages.
-    test("scope.target-snapshot", str, "snap", lambda x: x.startswith("@"))
-    test("name", str, cat="word")
-    test("scope.since", str, cat="snap")
-    test("scope.progressive", bool)
-    test("scope.allow-snapshot-creation", bool)
-    test("receiver.qube", str, cat="word")
-    test("receiver.dataset", str, cat="dataset")
-    if test("include-groups", list) and test("exclude-groups", list):
-        group_types = ("qubes","datasets")
-        groups = list(itertools.chain(config["include-groups"],config["exclude-groups"]))
-        for g in groups:
-            if test(g, cat="group"):
-                test(g+".type", validator=lambda x: x in group_types)
-                test(g+".members", list)
+        user_config = cls._parse_user_config(raw_user_config)
+        cls._check_objs_exist(user_config)
+        objects = [cls._mk_objects_pt2(o) for o in cls._mk_objects_pt1_gen(user_config)]
+        graph = cls._make_graph(objects)
+        print(f"Config validation {colours.OK}PASSED{colours.RESET}")
 
-    # if there were errors:
-    if validation_errors:
-        raise validation_errors
-    # if all tests passed:
-    return raw_config, config
+        o = cls()
+        o.name = user_config["name"]
+        o.graph = graph
+        vars(o).update((k,v) for k,v in locals().copy().items() if k in cls.PERSISTENT)
+        return o
+
+    def print_import_analysis(self):
+        print("Analysis:")
+        self._print_coverage_analysis(self.graph)
+        self._print_snapshots_analysis(self.user_config, self.objects)
+
+    @staticmethod
+    def _parse_user_config(raw_config):
+        try:
+            import yaml
+            config = yaml.safe_load(raw_config)
+        except Exception as e:
+            raise MyError("yaml error", e, error_code='yaml')
+
+        validation_errors = ConfigError()
+        class VErr(Exception): pass
+        def _inner_test(keys, strongtype=None, cat=None, validator=None):
+            x = config
+            for k in keys.split('.'):
+                try:
+                    x = x[k]
+                except KeyError:
+                    if cat == "group":
+                        raise VErr("Group is not defined")
+                    else:
+                        raise VErr("Missing required key")
+            if strongtype not in (None, type(x)):
+                raise VErr(f"Value must be type {strongtype.__name__}, but {type(x).__name__} was found.")
+            match cat:
+                case 'snap':
+                    if not re.fullmatch(r'(@[-\w]+|beginning)', x):
+                        raise VErr("Doesn't look like a snapshot name")
+                case 'word':
+                    if not re.fullmatch(r'[-\w]+', x):
+                        raise VErr("Contains invalid characters")
+                case 'dataset':
+                    if not re.fullmatch(r'\w[-\w]*(/?[-\w]+)*', x):
+                        raise VErr("Doesn't look like a dataset")
+            if validator is not None and not validator(x):
+                raise VErr("Failed validation")
+
+        def test(keys, *args, **kwargs):
+            nonlocal validation_errors
+            try:
+                _inner_test(keys, *args, **kwargs)
+            except VErr as e:
+                validation_errors += (keys, e.args[0])
+                return False
+            return True
+
+        # To truly validate things, we need to cross reference everything
+        # to real system objects (qubes, snapshots, etc.), which doesn't
+        # happen til later, so we can't be perfect here.
+        # The validation here is (mostly) to benefit the user with better
+        # error messages.
+        test("scope.target-snapshot", str, "snap", lambda x: x.startswith("@"))
+        test("name", str, cat="word")
+        test("scope.since", str, cat="snap")
+        test("scope.progressive", bool)
+        test("scope.allow-snapshot-creation", bool)
+        test("receiver.qube", str, cat="word")
+        test("receiver.dataset", str, cat="dataset")
+        if test("include-groups", list) and test("exclude-groups", list):
+            group_types = ("qubes","datasets")
+            groups = list(itertools.chain(config["include-groups"],config["exclude-groups"]))
+            groups_set = set(groups)
+            for g in groups_set:
+                if test(g, cat="group"):
+                    test(g+".type", validator=lambda x: x in group_types)
+                    test(g+".members", list)
+            if len(groups) != len(groups_set):
+                validation_errors += "groups", "Includes/excludes contain redundant group references"
+
+        if validation_errors:
+            raise validation_errors
+        #else
+        return config
+
+    @staticmethod
+    def _check_objs_exist(user_config):
+        """check if all referenced qubes and datasets exist
+        (except for receiver.dataset and all things in unused groups)"""
+        def all_of(t):
+            for g in itertools.chain(user_config["include-groups"],user_config["exclude-groups"]):
+                if user_config[g]["type"] == t:
+                    yield from user_config[g]["members"]
+        errs = ConfigError()
+        if user_config['receiver']['qube'] not in qube_list.get():
+            errs += ('receiver.qube', "Qube does not exist")
+        for q in all_of("qubes"):
+            if q not in qube_list.get():
+                errs += ("qube:"+q, "Qube does not exist")
+        for ds in all_of("datasets"):
+            if ds not in dataset_list.get():
+                errs += ("dataset:"+q, "Dataset does not exist")
+        if errs:
+            raise errs
+
+    @staticmethod
+    def _mk_objects_pt1_gen(user_config):
+        """atomize include/exclude targets into standalone objects,
+        and resolve all datasets"""
+        for r in ("include","exclude"):
+            for gn in user_config[f"{r}-groups"]:
+                for m in user_config[gn]["members"]:
+                    yield {
+                        "role": r,
+                        "groupname": gn,
+                        "member_name": m,
+                        "type": user_config[gn]["type"],
+                        "ignore_datasets": [],
+                    }
+
+    @staticmethod
+    def _mk_objects_pt2(o):
+        m = o["member_name"]
+        if o['type'] == "qubes":
+            o["name"] = "qube:" + m
+            vols = qubesd_query("admin.vm.volume.List",m)
+            vol_parents = set()
+            vol_pools = set()
+            infos = []
+            for vol in vols:
+                if vol == "kernel":
+                    continue
+                vol_info = qubesd_query("admin.vm.volume.Info",m,vol)
+                if vol_info["ephemeral"] != "False":
+                    raise Exception(["idk what ephemeral does",m,vol,vol_info])
+                if vol_info["pool"] not in qubes_pools_info.get():
+                    warn(f"not all of qube {m}'s volumes are in "
+                        "an applicable pool. Some volumes won't be backed up")
+                    continue
+                if vol_info["save_on_stop"] != "True":
+                    o['ignore_datasets'].append(vol_info["vid"])
+                    continue
+                vol_parent, vol_name = vol_info["vid"].rsplit('/',maxsplit=1)
+                assert vol == vol_name
+                vol_parents.add(vol_parent)
+                vol_pools.add(vol_info["pool"])
+                infos.append(vol_info)
+            if 1 == len(vol_parents) == len(vol_pools):
+                #all volumes share the same parent, use the parent for backup
+                o["datasets"] = [next(iter(vol_parents))]
+            else:
+                o["datasets"] = [i["vid"] for i in infos]
+        elif o['type'] == "datasets":
+            o["name"] = "dataset:" + m
+            o["datasets"] = [m]
+        else:
+            assert False
+        return o
+
+    @staticmethod
+    def _make_graph(objects):
+        """make graph, checking for duplicate and/or nested qubes and datasets"""
+        @(lambda x: dict(x()))
+        def graph():
+            qubes_containers = '|'.join(pi["container"] for pi in qubes_pools_info.get().values())
+            disp_pat = re.compile('(' + qubes_containers + r')/disp\d{1,4}')
+            for ds in dataset_list.get():
+                ignore = bool(disp_pat.fullmatch(ds)) or '/.' in ds
+                yield ds,{"own_obj": None, "descendant_objects": [], "ignore": ignore}
+        #
+        errs = ConfigError()
+        for o in objects:
+            for i,ds in enumerate(o["datasets"]):
+                node = graph[ds]
+                if node["own_obj"] is not None:
+                    msg = f"Duplicate reference conflicts with {node['own_obj'][0]['name']}"
+                    errs += o["name"], msg
+                # parents = [(pds,graph[pds]) for pds in parents_iter(ds)]
+                ancestor_objs = filter(bool, (graph[pds]["own_obj"] for pds in zfs_ancestors_iter(ds)))
+                ancestor_collisions = ((a,(o,i)) for a in ancestor_objs)
+                descendant_collisions = (((o,i),d) for d in node["descendant_objects"])
+                for a,d in itertools.chain(ancestor_collisions, descendant_collisions):
+                    errs += a[0]["name"], d[0]["name"]+" is nested in "+a[0]["datasets"][a[1]]
+                
+                node["own_obj"] = (o,i)
+                for pds in zfs_ancestors_iter(ds):
+                    graph[pds]["descendant_objects"].append((o,i))
+
+            for ids in o["ignore_datasets"]:
+                graph[ids]["ignore"] = True
+
+        if errs:
+            raise errs
+        return graph
+
+    @staticmethod
+    def _print_coverage_analysis(graph):
+        # analyze coverage (warn for qubes/datasets neither included nor excluded)
+        excluded = []
+        included = []
+        unspecified = []
+        ignores = 0
+        irrelevants = 0
+        for ds,info in sorted(graph.items()):
+            if info["own_obj"] is not None:
+                match info["own_obj"][0]["role"]:
+                    case "include":
+                        included.append(ds)
+                    case "exclude":
+                        excluded.append(ds)
+            else:
+                if not info["descendant_objects"]:
+                    try:
+                        pds = next(zfs_ancestors_iter(ds))
+                    except StopIteration:
+                        pass
+                    else:
+                        if not graph[pds]["descendant_objects"]:
+                            irrelevants += 1
+                            continue
+                    if info["ignore"]:
+                        ignores += 1
+                    else:
+                        unspecified.append(ds)
+        global warning_counter
+        warning_counter += len(unspecified)
+        
+        print("\nIncluded datasets:")
+        posi = f"{colours.GREEN}+{colours.RESET}"
+        print(posi,f'\n{posi} '.join(included))
+
+        print("\nExcluded datasets:")
+        nega = f"{colours.RED}-{colours.RESET}"
+        print(nega,f'\n{nega} '.join(excluded))
+
+        print(f"\n{colours.BRIGHT_YELLOW}Warning: The following datasets have not been " \
+            "referenced. Consider explicitly including or excluding them:")
+        print('-','\n- '.join(unspecified),f"{colours.RESET}")
+
+        print(f"\nAdditionally:\n{ignores} datasets have been automatically ignored " \
+            f"by the program's built-in rules.\n{irrelevants} datasets have " \
+            "been implicitly ignored based on the includes/excludes.")
+
+    @staticmethod
+    def _print_snapshots_analysis(user_config, objects):
+        # if snapshot creation is disabled, check if snapshots exist already (and warn if not)
+        # otherwise, if it's enabled, check if snapshotting will be blocked
+        def get_snapshots_for(ds):
+            p = subprocess.run(f"zfs list -H -t snapshot -r {ds}".split(),
+                capture_output=True, check=True, text=True)
+            return p.stdout.splitlines()
+        #
+        target = user_config["scope"]["target-snapshot"][1:]
+        snaps_exist = 0
+        snaps_to_create = 0
+        snaps_blocked = 0
+        for o in objects:
+            if o['role'] == 'exclude':
+                continue
+            for i,ds in enumerate(o["datasets"]):
+                has_snap = 'no'
+                for snap in get_snapshots_for(ds):
+                    sds,sep,label = snap.partition('@')
+                    assert sep == '@'
+                    if label == target:
+                        if sds == ds:
+                            has_snap = 'yes'
+                            break
+                        else:
+                            has_snap = 'descendant'
+                match has_snap:
+                    case 'no':
+                        snaps_to_create += 1
+                    case 'descendant':
+                        # only descendant snapshot(s) exist
+                        warn(f"Snapshot of {ds} is blocked and will " \
+                            "need to be created manually.")
+                        snaps_blocked += 1
+                    case 'yes':
+                        snaps_exist += 1
+        total_snaps = snaps_exist + snaps_to_create + snaps_blocked
+        #
+        print()
+        print(f"{snaps_exist}/{total_snaps} required snapshots currently exist.")
+        if user_config["scope"]["allow-snapshot-creation"]:
+            print(f"{snaps_to_create} snapshots are able to be automatically created.")
+        elif snaps_to_create + snaps_blocked > 0:
+            print("scope.allow-snapshot-creation is disabled and so snapshots " \
+                "must be created manually.")
+
+def zfs_ancestors_iter(ds):
+    while True:
+        ds,sep,_ = ds.rpartition('/')
+        if not sep:
+            return
+        yield ds
 
 def qubesd_query(call, dest, arg=None):
     args = ["qubesd-query","-e","dom0",call,dest,*([arg] if arg is not None else [])]
@@ -166,7 +406,7 @@ def qubesd_query(call, dest, arg=None):
     text_output = p.stdout[2:].decode("ascii")
     lines = list(filter(bool, text_output.splitlines()))
     try:
-        return dict(((k,v) for k,v in (l.split('=',maxsplit=1) for l in lines)))
+        return {k:v for k,v in (l.split('=',maxsplit=1) for l in lines)}
     except ValueError:
         return lines
 
@@ -247,218 +487,8 @@ subcmd = subcommands.get_add_decorator
 
 @subcmd('file1')
 def _check():
-    raw_config, config = new_config(options["file1"])
-    #print("Config passed basic format validation")
-
-    errs = ConfigError()
-
-    all_groups = config["include-groups"] + config["exclude-groups"]
-    if len(all_groups) != len(set(all_groups)):
-        raise MyError("Error: Includes/excludes contain redundant group references", error_code='input')
-
-    def all_of(t):
-        for g in all_groups:
-            if config[g]["type"] == t:
-                yield from config[g]["members"]
-
-    # check if all referenced qubes and datasets exist
-    # (except for receiver.dataset and all things in unused groups)
-    if config['receiver']['qube'] not in qube_list.get():
-        errs += ('receiver.qube', "Qube does not exist")
-    for q in all_of("qubes"):
-        if q not in qube_list.get():
-            errs += ("qube:"+q, "Qube does not exist")
-    for ds in all_of("datasets"):
-        if ds not in dataset_list.get():
-            errs += ("dataset:"+q, "Dataset does not exist")
-    if errs:
-        raise errs
-
-    # atomize include/exclude targets into standalone objects,
-    # and resolve all datasets
-    def mk_objects_pt1_gen():
-        for r in ("include","exclude"):
-            for gn in config[f"{r}-groups"]:
-                for m in config[gn]["members"]:
-                    yield {
-                        "role": r,
-                        "groupname": gn,
-                        "member_name": m,
-                        "type": config[gn]["type"],
-                        "ignore_datasets": [],
-                    }
-
-    def mk_objects_pt2(o):
-        m = o["member_name"]
-        if o['type'] == "qubes":
-            o["name"] = "qube:" + m
-            vols = qubesd_query("admin.vm.volume.List",m)
-            vol_parents = set()
-            vol_pools = set()
-            infos = []
-            for vol in vols:
-                if vol == "kernel":
-                    continue
-                vol_info = qubesd_query("admin.vm.volume.Info",m,vol)
-                if vol_info["ephemeral"] != "False":
-                    raise Exception(["idk what ephemeral does",m,vol,vol_info])
-                if vol_info["pool"] not in qubes_pools_info.get():
-                    warn(f"not all of qube {m}'s volumes are in "
-                        "an applicable pool. Some volumes won't be backed up")
-                    continue
-                if vol_info["save_on_stop"] != "True":
-                    o['ignore_datasets'].append(vol_info["vid"])
-                    continue
-                vol_parent, vol_name = vol_info["vid"].rsplit('/',maxsplit=1)
-                assert vol == vol_name
-                vol_parents.add(vol_parent)
-                vol_pools.add(vol_info["pool"])
-                infos.append(vol_info)
-            if 1 == len(vol_parents) == len(vol_pools):
-                #all volumes share the same parent, use the parent for backup
-                o["datasets"] = [next(iter(vol_parents))]
-            else:
-                o["datasets"] = [i["vid"] for i in infos]
-        elif o['type'] == "datasets":
-            o["name"] = "dataset:" + m
-            o["datasets"] = [m]
-        else:
-            assert False
-        return o
-
-    objects = [mk_objects_pt2(o) for o in mk_objects_pt1_gen()]
-
-    # make graph, checking for duplicate and/or nested qubes and datasets
-    def ancestors_iter(ds):
-        while True:
-            ds,sep,_ = ds.rpartition('/')
-            if not sep:
-                return
-            yield ds
-    @(lambda x: dict(x()))
-    def graph():
-        qubes_containers = '|'.join(pi["container"] for pi in qubes_pools_info.get().values())
-        disp_pat = re.compile('(' + qubes_containers + r')/disp\d{1,4}')
-        for ds in dataset_list.get():
-            ignore = bool(disp_pat.fullmatch(ds)) or '/.' in ds
-            yield ds,{"own_obj": None, "descendant_objects": [], "ignore": ignore}
-    #
-    for o in objects:
-        for i,ds in enumerate(o["datasets"]):
-            node = graph[ds]
-            if node["own_obj"] is not None:
-                msg = f"Duplicate reference conflicts with {node['own_obj'][0]['name']}"
-                errs += o["name"], msg
-            # parents = [(pds,graph[pds]) for pds in parents_iter(ds)]
-            ancestor_objs = filter(bool, (graph[pds]["own_obj"] for pds in ancestors_iter(ds)))
-            ancestor_collisions = ((a,(o,i)) for a in ancestor_objs)
-            descendant_collisions = (((o,i),d) for d in node["descendant_objects"])
-            for a,d in itertools.chain(ancestor_collisions, descendant_collisions):
-                errs += a[0]["name"], d[0]["name"]+" is nested in "+a[0]["datasets"][a[1]]
-            
-            node["own_obj"] = (o,i)
-            for pds in ancestors_iter(ds):
-                graph[pds]["descendant_objects"].append((o,i))
-
-        for ids in o["ignore_datasets"]:
-            graph[ids]["ignore"] = True
-
-    if errs:
-        raise errs
-
-    # analyze coverage (warn for qubes/datasets neither included nor excluded)
-    excluded = []
-    included = []
-    unspecified = []
-    ignores = 0
-    irrelevants = 0
-    for ds,info in sorted(graph.items()):
-        if info["own_obj"] is not None:
-            match info["own_obj"][0]["role"]:
-                case "include":
-                    included.append(ds)
-                case "exclude":
-                    excluded.append(ds)
-        else:
-            if not info["descendant_objects"]:
-                try:
-                    pds = next(ancestors_iter(ds))
-                except StopIteration:
-                    pass
-                else:
-                    if not graph[pds]["descendant_objects"]:
-                        irrelevants += 1
-                        continue
-                if info["ignore"]:
-                    ignores += 1
-                else:
-                    unspecified.append(ds)
-    global warning_counter
-    warning_counter += len(unspecified)
-    
-    print(f"Config validation {colours.OK}PASSED{colours.RESET}")
-    print("Analysis:")
-
-    print("\nIncluded datasets:")
-    posi = f"{colours.GREEN}+{colours.RESET}"
-    print(posi,f'\n{posi} '.join(included))
-
-    print("\nExcluded datasets:")
-    nega = f"{colours.RED}-{colours.RESET}"
-    print(nega,f'\n{nega} '.join(excluded))
-
-    print(f"\n{colours.BRIGHT_YELLOW}Warning: The following datasets have not been " \
-        "referenced. Consider explicitly including or excluding them:")
-    print('-','\n- '.join(unspecified),f"{colours.RESET}")
-
-    print(f"\nAdditionally:\n{ignores} datasets have been automatically ignored " \
-        f"by the program's built-in rules.\n{irrelevants} datasets have " \
-        "been implicitly ignored based on the includes/excludes.")
-
-    # if snapshot creation is disabled, check if snapshots exist already (and warn if not)
-    # otherwise, if it's enabled, check if snapshotting will be blocked
-    def get_snapshots_for(ds):
-        p = subprocess.run(f"zfs list -H -t snapshot -r {ds}".split(),
-            capture_output=True, check=True, text=True)
-        return p.stdout.splitlines()
-    #
-    target = config["scope"]["target-snapshot"][1:]
-    snaps_exist = 0
-    snaps_to_create = 0
-    snaps_blocked = 0
-    for o in objects:
-        if o['role'] == 'exclude':
-            continue
-        for i,ds in enumerate(o["datasets"]):
-            has_snap = 'no'
-            for snap in get_snapshots_for(ds):
-                sds,sep,label = snap.partition('@')
-                assert sep == '@'
-                if label == target:
-                    if sds == ds:
-                        has_snap = 'yes'
-                        break
-                    else:
-                        has_snap = 'descendant'
-            match has_snap:
-                case 'no':
-                    snaps_to_create += 1
-                case 'descendant':
-                    # only descendant snapshot(s) exist
-                    warn(f"Snapshot of {ds} is blocked and will " \
-                        "need to be created manually.")
-                    snaps_blocked += 1
-                case 'yes':
-                    snaps_exist += 1
-    total_snaps = snaps_exist + snaps_to_create + snaps_blocked
-    #
-    print()
-    print(f"{snaps_exist}/{total_snaps} required snapshots currently exist.")
-    if config["scope"]["allow-snapshot-creation"]:
-        print(f"{snaps_to_create} snapshots are able to be automatically created.")
-    elif snaps_to_create + snaps_blocked > 0:
-        print("scope.allow-snapshot-creation is disabled and so snapshots " \
-            "must be created manually.")
+    config = Config.import_(options["file1"])
+    config.print_import_analysis()
 
 @subcmd('file1')
 def _import():
