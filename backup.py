@@ -14,8 +14,8 @@ ERROR_CODES = {
 }
 
 import sys, traceback, itertools, os.path
-import argparse, re, subprocess
-import types
+import argparse, re, subprocess, datetime, json
+import types, collections.abc
 #from copy import deepcopy
 
 colours = types.SimpleNamespace(
@@ -83,8 +83,105 @@ class ConfigError(MyError):
     def __bool__(self):
         return bool(self.verrs)
 
+class ConfigHeader(collections.abc.Mapping):
+    FIELD_TERM_CHAR = b';'
+    CHAIN_TERM_CHAR = b'\n'
+    VALUE_CHARS = set(range(0x20,0x80)) - set(FIELD_TERM_CHAR+CHAIN_TERM_CHAR)
+    FILE_SIG = [
+        (2, "bu"),
+        (4, "ver"),
+    ]
+    FIELDS = [
+        (2, "enc"),
+        (16, "importdate"),
+        (2, "state"),
+        (21, "comment"),
+    ]
+    FILE_SIG_CUR_VERSION = {
+        "bu": "bu",
+        "ver": "1",
+    }
+
+    def __init__(self):
+        self.sig = self.FILE_SIG_CUR_VERSION.copy()
+        self.info = dict((name,"") for sz,name in self.FIELDS)
+
+    def __contains__(self, k):
+        return k in self.info
+
+    def __iter__(self):
+        return iter(self.info)
+
+    def __len__(self):
+        return len(self.info)
+
+    def __getitem__(self, k):
+        return self.info[k]
+
+    def __setitem__(self, k, v):
+        self.info[k] = self._validate_value(self.FIELDS, k, v)
+
+    def trunc(self, k, v):
+        self.info[k] = self._validate_value(self.FIELDS, k, v, truncate=True)
+
+    @classmethod
+    def read_chain(cls, f):
+        o = cls()
+        o.sig = cls._read_header(cls.FILE_SIG, f)
+        if o.sig != cls.FILE_SIG_CUR_VERSION:
+            raise Exception("unrecognized file header")
+        o.info = cls._read_header(cls.FIELDS, f)
+        if f.read(1) != cls.CHAIN_TERM_CHAR:
+            raise Exception("corrupt header")
+        return o
+
+    def write_chain(self, f):
+        self._write_header(self.FILE_SIG, f, self.FILE_SIG_CUR_VERSION)
+        self._write_header(self.FIELDS, f, self.info)
+        f.write(b'\n')
+
+    #
+
+    def _write_header(self, defin, f, obj):
+        for sz,name in defin:
+            save_v = obj[name].encode('ascii', errors='strict')
+            f.write(save_v.ljust(sz, self.FIELD_TERM_CHAR))
+
+    @staticmethod
+    def _getfielddef(defin, k):
+        for i,(sz,name) in enumerate(defin):
+            if name == k:
+                return (i,sz)
+        raise KeyError()
+
+    @classmethod
+    def _validate_value(cls, defin, k, v, truncate=False):
+        _,field_sz = cls._getfielddef(defin, k)
+        saved_v = str.encode(v, 'ascii', errors='strict')
+        if not (set(saved_v) <= cls.VALUE_CHARS):
+            raise ValueError("invalid characters")
+        if truncate:
+            v = saved_v[:field_sz].decode('ascii')
+        elif len(saved_v) > field_sz:
+            raise ValueError("string too long")
+        return v
+
+    @classmethod
+    def _read_header(cls, defin, f):
+        h_sz = sum(next(zip(defin)))
+        data = f.read(h_sz)
+        if len(data) != h_sz:
+            raise Exception("header could not be read")
+        items = []
+        offset = 0
+        for sz,k in defin:
+            v = data[offset:offset+sz].split(cls.FIELD_TERM_CHAR)[0].decode("ascii")
+            items.append((k,v))
+            offset += sz
+        return dict(items)
+
 class Config():
-    PERSISTENT = ('name','user_config','raw_user_config', 'objects')
+    PERSISTENT = ('user_config','raw_user_config', 'objects')
 
     @classmethod
     def import_(cls, filename):
@@ -99,13 +196,40 @@ class Config():
         cls._check_objs_exist(user_config)
         objects = [cls._mk_objects_pt2(o) for o in cls._mk_objects_pt1_gen(user_config)]
         graph = cls._make_graph(objects)
-        print(f"Config validation {colours.OK}PASSED{colours.RESET}")
 
         o = cls()
-        o.name = user_config["name"]
         o.graph = graph
         vars(o).update((k,v) for k,v in locals().copy().items() if k in cls.PERSISTENT)
+        o.header = ConfigHeader()
+        o.header["importdate"] = \
+            datetime.datetime.now().isoformat(sep=' ',timespec='minutes')
+
+        o._serialize()
+        print(f"Config validation {colours.OK}PASSED{colours.RESET}")
         return o
+
+    def save(self):
+        with open(self.filepath(self.name), 'wb') as f:
+            self.header.write_chain(f)
+            f.write(self._serialize())
+
+    @classmethod
+    def load(cls, name):
+        o = cls()
+        with open(cls.filepath(name), 'rb') as f:
+            o.header = ConfigHeader.read_chain(f)
+            serialized_data = f.read()
+        data = json.loads(serialized_data.decode('ascii', errors='strict'))
+        vars(o).update(data)
+        return o
+
+    @property
+    def name(self):
+        return self.user_config["name"]
+
+    @staticmethod
+    def filepath(name):
+        return os.path.join(options["metadata_dir"], name + ".backupcfg")
 
     def print_import_analysis(self):
         print("Analysis:")
@@ -282,7 +406,7 @@ class Config():
                 descendant_collisions = (((o,i),d) for d in node["descendant_objects"])
                 for a,d in itertools.chain(ancestor_collisions, descendant_collisions):
                     errs += a[0]["name"], d[0]["name"]+" is nested in "+a[0]["datasets"][a[1]]
-                
+
                 node["own_obj"] = (o,i)
                 for pds in zfs_ancestors_iter(ds):
                     graph[pds]["descendant_objects"].append((o,i))
@@ -325,7 +449,7 @@ class Config():
                         unspecified.append(ds)
         global warning_counter
         warning_counter += len(unspecified)
-        
+
         print("\nIncluded datasets:")
         posi = f"{colours.GREEN}+{colours.RESET}"
         print(posi,f'\n{posi} '.join(included))
@@ -388,6 +512,10 @@ class Config():
         elif snaps_to_create + snaps_blocked > 0:
             print("scope.allow-snapshot-creation is disabled and so snapshots " \
                 "must be created manually.")
+
+    def _serialize(self):
+        obj = dict((name, getattr(self,name)) for name in self.PERSISTENT)
+        return json.dumps(obj, indent=2).encode('ascii', errors='strict')
 
 def zfs_ancestors_iter(ds):
     while True:
@@ -483,25 +611,6 @@ class SubcommandsList():
 subcommands = SubcommandsList()
 subcmd = subcommands.get_add_decorator
 
-
-
-@subcmd('file1')
-def _check():
-    config = Config.import_(options["file1"])
-    config.print_import_analysis()
-
-@subcmd('file1')
-def _import():
-    if not os.path.isdir(options["metadata_dir"]):
-        e = FileNotFoundError(options["metadata_dir"])
-        raise MyError(e, "options.metadata_dir is not valid", error_code='fatal')
-
-    raise NotImplementedError()
-    #raw_config, config = new_config(options["file1"])
-    #print(config)
-
-
-
 def get_cli_options():
     cmd = subcommands.by_name[sys.argv[1]]
 
@@ -512,6 +621,26 @@ def get_cli_options():
     opts = p.parse_args(sys.argv[2:])
 
     return cmd, dict(vars(opts))
+
+
+
+###################
+
+@subcmd('file1')
+def _check():
+    config = Config.import_(options["file1"])
+    config.print_import_analysis()
+
+@subcmd('file1')
+def _import():
+    if not os.path.isdir(options["metadata_dir"]):
+        e = FileNotFoundError(options["metadata_dir"])
+        msg = "options.metadata_dir is not valid; you probably " \
+            "need to create the directory"
+        raise MyError(e, msg, error_code='fatal')
+
+    config = Config.import_(options["file1"])
+    config.save()
 
 def main():
     try:
