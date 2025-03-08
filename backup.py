@@ -12,8 +12,10 @@ ERROR_CODES = {
     "yaml": 3,
     "notfound": 4,# only when specifying non-existant files on the command line
 }
+CONFIG_FILE_VERSION = "1"
+CONFIG_FILE_EXT = "backupcfg"
 
-import sys, traceback, itertools, os.path
+import sys, traceback, itertools, os, os.path
 import argparse, re, subprocess, datetime, json
 import types, collections.abc
 #from copy import deepcopy
@@ -99,7 +101,7 @@ class ConfigHeader(collections.abc.Mapping):
     ]
     FILE_SIG_CUR_VERSION = {
         "bu": "bu",
-        "ver": "1",
+        "ver": CONFIG_FILE_VERSION,
     }
 
     def __init__(self):
@@ -168,7 +170,7 @@ class ConfigHeader(collections.abc.Mapping):
 
     @classmethod
     def _read_header(cls, defin, f):
-        h_sz = sum(next(zip(defin)))
+        h_sz = sum(next(zip(*defin)))
         data = f.read(h_sz)
         if len(data) != h_sz:
             raise Exception("header could not be read")
@@ -229,7 +231,25 @@ class Config():
 
     @staticmethod
     def filepath(name):
-        return os.path.join(options["metadata_dir"], name + ".backupcfg")
+        return os.path.join(options["metadata_dir"], name + '.' + CONFIG_FILE_EXT)
+
+    @classmethod
+    def all_config_names(cls):
+        if not os.path.isdir(options["metadata_dir"]):
+            return set()
+        files = os.listdir(options["metadata_dir"])
+        return set(fn.rsplit('.',1)[0] for fn in files if fn.endswith('.'+CONFIG_FILE_EXT))
+
+    @classmethod
+    def list_configs(cls):
+        r = []
+        for name in cls.all_config_names():
+            with open(cls.filepath(name), 'rb') as f:
+                header = ConfigHeader.read_chain(f)
+            row = (header["importdate"], name, header["state"], header["comment"])
+            r.append(row)
+        r.sort()
+        return r
 
     def print_import_analysis(self):
         print("Analysis:")
@@ -624,23 +644,34 @@ def get_cli_options():
 
 
 
-###################
+###################################################################
 
 @subcmd('file1')
 def _check():
     config = Config.import_(options["file1"])
     config.print_import_analysis()
+    if config.name in Config.all_config_names():
+        warn(f"A configuration named {config.name} already exists, " \
+            "so importing with that name will fail.")
 
 @subcmd('file1')
 def _import():
     if not os.path.isdir(options["metadata_dir"]):
         e = FileNotFoundError(options["metadata_dir"])
-        msg = "options.metadata_dir is not valid; you probably " \
+        msg = "options.metadata_dir is not valid; you may " \
             "need to create the directory"
         raise MyError(e, msg, error_code='fatal')
 
     config = Config.import_(options["file1"])
+    if config.name in Config.all_config_names():
+        msg = "Refusing to overwrite configuration of same name"
+        raise MyError(msg, error_code='fatal')
     config.save()
+
+@subcmd()
+def _list():
+    for c in Config.list_configs():
+        print(*c)
 
 def main():
     try:
