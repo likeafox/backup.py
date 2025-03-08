@@ -15,9 +15,9 @@ ERROR_CODES = {
 CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
 
-import sys, traceback, itertools, os, os.path
-import argparse, re, subprocess, datetime, json
-import types, collections.abc
+import sys, traceback, itertools, os, os.path, time, \
+    argparse, re, subprocess, datetime, json
+import types, collections, collections.abc
 #from copy import deepcopy
 
 colours = types.SimpleNamespace(
@@ -40,6 +40,11 @@ def warn(msg):
     global warning_counter
     warning_counter += 1
     print(f"{colours.WARN}Warning: {msg}{colours.RESET}", file=sys.stderr)
+
+def track_commandline(args):
+    if options['verbose']:
+        cmdline = ' '.join([(f'"{a}"' if ' ' in a else a) for a in args])
+        print(f"{colours.BRIGHT_BLACK}{cmdline}{colours.RESET}", file=sys.stderr)
 
 class MyError(Exception):
     def __init__(self, *args, error_code=None, **kwargs):
@@ -197,17 +202,18 @@ class Config():
         user_config = cls._parse_user_config(raw_user_config)
         cls._check_objs_exist(user_config)
         objects = [cls._mk_objects_pt2(o) for o in cls._mk_objects_pt1_gen(user_config)]
-        graph = cls._make_graph(objects)
 
         o = cls()
-        o.graph = graph
         vars(o).update((k,v) for k,v in locals().copy().items() if k in cls.PERSISTENT)
         o.header = ConfigHeader()
         o.header["importdate"] = \
             datetime.datetime.now().isoformat(sep=' ',timespec='minutes')
 
         o._serialize()
+        o.get_graph()
+        o._check_on_all_snapshots()
         print(f"Config validation {colours.OK}PASSED{colours.RESET}")
+        time.sleep(0.9)
         return o
 
     def save(self):
@@ -251,10 +257,17 @@ class Config():
         r.sort()
         return r
 
+    def get_graph(self):
+        try:
+            return self._graph
+        except AttributeError:
+            self._graph = self._make_graph(self.objects)
+            return self._graph
+
     def print_import_analysis(self):
         print("Analysis:")
-        self._print_coverage_analysis(self.graph)
-        self._print_snapshots_analysis(self.user_config, self.objects)
+        self._print_coverage_analysis(self.get_graph())
+        self._print_snapshots_analysis()
 
     @staticmethod
     def _parse_user_config(raw_config):
@@ -392,14 +405,22 @@ class Config():
                 infos.append(vol_info)
             if 1 == len(vol_parents) == len(vol_pools):
                 #all volumes share the same parent, use the parent for backup
-                o["datasets"] = [next(iter(vol_parents))]
+                dataset_names = [next(iter(vol_parents))]
             else:
-                o["datasets"] = [i["vid"] for i in infos]
+                dataset_names = [i["vid"] for i in infos]
         elif o['type'] == "datasets":
             o["name"] = "dataset:" + m
-            o["datasets"] = [m]
+            dataset_names = [m]
         else:
             assert False
+        if o['role'] == "include":
+            dataset_info = {
+                # "ds": <dataset name>,
+                "snap":"unknown",
+            }
+        else:
+            dataset_info = {}
+        o['datasets'] = [(dataset_info | {"ds":n}) for n in dataset_names]
         return o
 
     @staticmethod
@@ -415,17 +436,19 @@ class Config():
         #
         errs = ConfigError()
         for o in objects:
-            for i,ds in enumerate(o["datasets"]):
+            for i,ds_info in enumerate(o['datasets']):
+                ds = ds_info['ds']
                 node = graph[ds]
                 if node["own_obj"] is not None:
                     msg = f"Duplicate reference conflicts with {node['own_obj'][0]['name']}"
-                    errs += o["name"], msg
+                    errs += o['name'], msg
                 # parents = [(pds,graph[pds]) for pds in parents_iter(ds)]
                 ancestor_objs = filter(bool, (graph[pds]["own_obj"] for pds in zfs_ancestors_iter(ds)))
                 ancestor_collisions = ((a,(o,i)) for a in ancestor_objs)
                 descendant_collisions = (((o,i),d) for d in node["descendant_objects"])
                 for a,d in itertools.chain(ancestor_collisions, descendant_collisions):
-                    errs += a[0]["name"], d[0]["name"]+" is nested in "+a[0]["datasets"][a[1]]
+                    msg = f"{d[0]['name']} is nested in {a[0]['datasets'][a[1]]['ds']}"
+                    errs += a[0]['name'], msg
 
                 node["own_obj"] = (o,i)
                 for pds in zfs_ancestors_iter(ds):
@@ -486,52 +509,63 @@ class Config():
             f"by the program's built-in rules.\n{irrelevants} datasets have " \
             "been implicitly ignored based on the includes/excludes.")
 
-    @staticmethod
-    def _print_snapshots_analysis(user_config, objects):
-        # if snapshot creation is disabled, check if snapshots exist already (and warn if not)
-        # otherwise, if it's enabled, check if snapshotting will be blocked
-        def get_snapshots_for(ds):
-            p = subprocess.run(f"zfs list -H -t snapshot -r {ds}".split(),
-                capture_output=True, check=True, text=True)
-            return p.stdout.splitlines()
-        #
-        target = user_config["scope"]["target-snapshot"][1:]
-        snaps_exist = 0
-        snaps_to_create = 0
-        snaps_blocked = 0
-        for o in objects:
-            if o['role'] == 'exclude':
+    def _check_on_snapshot_state(self, ds_info, reset=False):
+        if 'snap' not in ds_info:
+            raise TypeError("There is no snapshot state associated with "\
+                "that dataset. The function might have been mistakenly " \
+                "called on an excluded object.")
+        if ds_info['snap'] in ('yes','done') and not reset:
+            return
+        ds = ds_info['ds']
+        target = self.user_config['scope']['target-snapshot'][1:]
+        args = f"zfs list -H -t snapshot -r {ds}".split()
+        track_commandline(args)
+        p = subprocess.run(args, capture_output=True, check=True, text=True)
+        snapshots = p.stdout.splitlines()
+        has_snap = 'no'
+        for snap in snapshots:
+            sds,sep,label = snap.partition('@')
+            assert sep == '@'
+            if label == target:
+                if sds == ds:
+                    has_snap = 'yes'
+                    break
+                else:
+                    has_snap = 'descendant'
+        ds_info['snap'] = {'no':'would', 'descendant':'blocked', 'yes':'yes'}[has_snap]
+
+    def _check_on_all_snapshots(self):
+        for o in self.objects:
+            if o['role'] != 'include':
                 continue
-            for i,ds in enumerate(o["datasets"]):
-                has_snap = 'no'
-                for snap in get_snapshots_for(ds):
-                    sds,sep,label = snap.partition('@')
-                    assert sep == '@'
-                    if label == target:
-                        if sds == ds:
-                            has_snap = 'yes'
-                            break
-                        else:
-                            has_snap = 'descendant'
-                match has_snap:
-                    case 'no':
-                        snaps_to_create += 1
-                    case 'descendant':
-                        # only descendant snapshot(s) exist
-                        warn(f"Snapshot of {ds} is blocked and will " \
-                            "need to be created manually.")
-                        snaps_blocked += 1
-                    case 'yes':
-                        snaps_exist += 1
-        total_snaps = snaps_exist + snaps_to_create + snaps_blocked
-        #
+            for ds_info in o["datasets"]:
+                self._check_on_snapshot_state(ds_info)
+
+    def _print_snapshots_analysis(self):
+        count = collections.Counter()
+        for o in self.objects:
+            for ds_info in o['datasets']:
+                try:
+                    count[ds_info['snap']] += 1
+                except KeyError:
+                    pass
         print()
-        print(f"{snaps_exist}/{total_snaps} required snapshots currently exist.")
-        if user_config["scope"]["allow-snapshot-creation"]:
-            print(f"{snaps_to_create} snapshots are able to be automatically created.")
-        elif snaps_to_create + snaps_blocked > 0:
+        if count['unknown'] > 0:
+            if count.total() == count['unknown']:
+                warn("Requested snapshots analysis results but no analysis has been done")
+            else:
+                warn("Refusing to print incomplete snapshot analysis results. " \
+                    f"({count['unknown']} objects would be omitted)")
+            return
+
+        print(f"{count['yes']+count['done']}/{count.total()} required snapshots currently exist.")
+        if self.user_config['scope']['allow-snapshot-creation']:
+            print(f"{count['would']} snapshots are able to be automatically created.")
+        elif count['would'] + count['blocked'] > 0:
             print("scope.allow-snapshot-creation is disabled and so snapshots " \
                 "must be created manually.")
+        if count['unknown'] > 0:
+            warn(f"Incomplete snapshot analysis: {count['unknown']} objects were omitted.")
 
     def _serialize(self):
         obj = dict((name, getattr(self,name)) for name in self.PERSISTENT)
@@ -546,6 +580,7 @@ def zfs_ancestors_iter(ds):
 
 def qubesd_query(call, dest, arg=None):
     args = ["qubesd-query","-e","dom0",call,dest,*([arg] if arg is not None else [])]
+    track_commandline(args)
     p = subprocess.run(args, capture_output=True)
     ret_code = p.stdout[:2]
     if ret_code != b'0\0':
@@ -568,9 +603,7 @@ class LazySystemQuery():
 
     @staticmethod
     def cmd(*args):
-        if options["verbose"]:
-            cmdline = ' '.join([(f'"{a}"' if ' ' in a else a) for a in args])
-            print(f"{colours.BRIGHT_BLACK}{cmdline}{colours.RESET}", file=sys.stderr)
+        track_commandline(args)
         p = subprocess.run(args, capture_output=True, check=True, text=True)
         return p.stdout
 
@@ -653,6 +686,8 @@ def _check():
     if config.name in Config.all_config_names():
         warn(f"A configuration named {config.name} already exists, " \
             "so importing with that name will fail.")
+    else:
+        print("Configuration can be imported")
 
 @subcmd('file1')
 def _import():
