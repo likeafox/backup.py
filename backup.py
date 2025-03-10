@@ -1,10 +1,11 @@
 #!/usr/bin/python3
 
 options = {
-    "metadata_dir": "/home/likeafox/backup_test/metadata",
+    "metadata_dir": "/root/backup_test/metadata",
     # verbose is here so it can have a value at program-initialization time
     # gets overwritten by cli opts early on
-    "verbose": True
+    "verbose": True,
+    "always-prime": True,
 }
 ERROR_CODES = {
     "input": 1,
@@ -18,7 +19,11 @@ CONFIG_FILE_EXT = "backupcfg"
 import sys, traceback, itertools, os, os.path, time, \
     argparse, re, subprocess, datetime, json
 import types, collections, collections.abc
+chain_iter = itertools.chain.from_iterable
 #from copy import deepcopy
+import qubesadmin
+qapp = qubesadmin.Qubes()
+import libzfs_core
 
 colours = types.SimpleNamespace(
     OK = '\x1b[32m', #green
@@ -36,15 +41,34 @@ colours = types.SimpleNamespace(
 )
 
 warning_counter = 0
-def warn(msg):
+def warn(msg, prefix="Warning :"):
     global warning_counter
     warning_counter += 1
-    print(f"{colours.WARN}Warning: {msg}{colours.RESET}", file=sys.stderr)
+    print(f"{colours.WARN}{prefix}{msg}{colours.RESET}", file=sys.stderr)
+
+def print_bg_msg(msg):
+    if options['verbose']:
+        print(f"{colours.BRIGHT_BLACK}{msg}{colours.RESET}", file=sys.stderr)
 
 def track_commandline(args):
-    if options['verbose']:
-        cmdline = ' '.join([(f'"{a}"' if ' ' in a else a) for a in args])
-        print(f"{colours.BRIGHT_BLACK}{cmdline}{colours.RESET}", file=sys.stderr)
+    cmdline = ' '.join([(f'"{a}"' if ' ' in a else a) for a in args])
+    print_bg_msg(cmdline)
+
+def run_cmd(*args, **kwargs):
+    opts = {"capture_output":True, "check":False, "text":True} | kwargs
+    track_commandline(args)
+    p = subprocess.run(args, **opts)
+
+    if p.stderr:
+        print_bg_msg(p.stderr)
+    try:
+        p.check_returncode()
+    except:
+        if p.stdout:
+            print_bg_msg(p.stdout)
+        raise
+
+    return p.stdout
 
 class MyError(Exception):
     def __init__(self, *args, error_code=None, **kwargs):
@@ -211,7 +235,8 @@ class Config():
 
         o._serialize()
         o.get_graph()
-        o._check_on_all_snapshots()
+        for ds_info in o.included_datasets:
+            o._check_on_snapshot_state(ds_info)
         print(f"Config validation {colours.OK}PASSED{colours.RESET}")
         time.sleep(0.9)
         return o
@@ -257,17 +282,78 @@ class Config():
         r.sort()
         return r
 
+    @property
+    def included_datasets(self):
+        try:
+            r = self._included_datasets
+        except:
+            r = self._included_datasets = list(
+                chain_iter(o['datasets'] for o in self.objects if o['role'] == 'include')
+            )
+        return r
+
     def get_graph(self):
         try:
-            return self._graph
-        except AttributeError:
-            self._graph = self._make_graph(self.objects)
-            return self._graph
+            r = self._graph
+        except:
+            r = self._graph = self._make_graph(self.objects)
+        return r
 
     def print_import_analysis(self):
         print("Analysis:")
         self._print_coverage_analysis(self.get_graph())
+        print()
         self._print_snapshots_analysis()
+
+    def do_snapshots(self):
+        def ds_gen():
+            for o in self.objects:
+                for ds_info in o["datasets"]:
+                    yield (ds_info['ds'], ds_info, o)
+        #
+        deferred = 0
+        target = self.user_config['scope']['target-snapshot']
+        #
+        for ds,ds_info,o in ds_gen():
+            if ds_info['snap'] in ('unknown','blocked'):
+                self._check_on_snapshot_state(ds_info)
+
+            # can we snap?
+            if ds_info['snap'] != 'would':
+                continue
+            if o['type'] == 'qubes':
+                args = f"qvm-check -q --running {o['member_name']}".split()
+                exitcode = subprocess.run(args).returncode
+                if exitcode == 0:
+                    warn(f"Qube {o['member_name']} is running. Deferring snapshot creation.")
+                    deferred += 1
+                    continue
+            elif o['type'] == 'datasets':
+                zvols = contained_zvols_attached_to_any_domain(ds)
+                if zvols:
+                    for zvol in zvols:
+                        warn(f"Volume {zvol} is attached to a qube. Deferring snapshot creation.")
+                    deferred += 1
+                    continue
+
+            # yes, snap
+            snap_name = ds+target
+            primer_name = ds+target+"-primer"
+            prime = (( \
+                    self.user_config['scope']['since'] == 'beginning' and \
+                    self.user_config['scope']['progressive'] == False \
+                ) or options['always-prime']) \
+                and not libzfs_core.lzc_exists(primer_name.encode('ascii'))
+            if prime:
+                run_cmd(("zfs","snapshot",primer_name))
+            run_cmd(("zfs","snapshot","-r",snap_name))
+            print("snapshotted "+ds)
+            ds_info['snap'] = 'done'
+
+        self._print_snapshots_analysis()
+        if deferred:
+            warn(f"{deferred} deferred snapshots. Re-run the command once " \
+                "the preconditions are satisfied.")
 
     @staticmethod
     def _parse_user_config(raw_config):
@@ -455,8 +541,8 @@ class Config():
                     graph[pds]["descendant_objects"].append((o,i))
 
             for ids in o["ignore_datasets"]:
-                graph[ids]["ignore"] = True
-
+                if ids in graph:
+                    graph[ids]["ignore"] = True
         if errs:
             raise errs
         return graph
@@ -490,6 +576,8 @@ class Config():
                         ignores += 1
                     else:
                         unspecified.append(ds)
+                else:
+                    irrelevants += 1
         global warning_counter
         warning_counter += len(unspecified)
 
@@ -519,9 +607,7 @@ class Config():
         ds = ds_info['ds']
         target = self.user_config['scope']['target-snapshot'][1:]
         args = f"zfs list -H -t snapshot -r {ds}".split()
-        track_commandline(args)
-        p = subprocess.run(args, capture_output=True, check=True, text=True)
-        snapshots = p.stdout.splitlines()
+        snapshots = run_cmd(*args).splitlines()
         has_snap = 'no'
         for snap in snapshots:
             sds,sep,label = snap.partition('@')
@@ -534,22 +620,10 @@ class Config():
                     has_snap = 'descendant'
         ds_info['snap'] = {'no':'would', 'descendant':'blocked', 'yes':'yes'}[has_snap]
 
-    def _check_on_all_snapshots(self):
-        for o in self.objects:
-            if o['role'] != 'include':
-                continue
-            for ds_info in o["datasets"]:
-                self._check_on_snapshot_state(ds_info)
-
     def _print_snapshots_analysis(self):
         count = collections.Counter()
-        for o in self.objects:
-            for ds_info in o['datasets']:
-                try:
-                    count[ds_info['snap']] += 1
-                except KeyError:
-                    pass
-        print()
+        for ds_info in self.included_datasets:
+            count[ds_info['snap']] += 1
         if count['unknown'] > 0:
             if count.total() == count['unknown']:
                 warn("Requested snapshots analysis results but no analysis has been done")
@@ -597,15 +671,8 @@ class LazySystemQuery():
     def __init__(self, args, postprocess=(lambda x: x), cmd=None):
         self.args = args
         self.postprocess = postprocess
-        if cmd is not None:
-            self.cmd = cmd
+        self.cmd = cmd or run_cmd
         self.cache = None
-
-    @staticmethod
-    def cmd(*args):
-        track_commandline(args)
-        p = subprocess.run(args, capture_output=True, check=True, text=True)
-        return p.stdout
 
     def get(self, refresh_cache=False):
         if refresh_cache or (self.cache is None):
@@ -625,6 +692,31 @@ class LazySystemQuery():
 qube_list = LazySystemQuery(["qvm-ls","--raw-list"], (lambda x: set(str.split(x))))
 dataset_list = LazySystemQuery("zfs list -H -o name".split(), (lambda x: set(str.splitlines(x))))
 qubes_pools_info = LazySystemQuery([], cmd=LazySystemQuery.get_zfs_qubes_pools_info)
+
+def contained_zvols_attached_to_any_domain(dataset):
+    """The specified dataset and all of its descendants are are checked
+    to see if they are attached to any qubes, and if so, the return value
+    is the set of those datasets which are attached. If none of the datasets
+    are attached to a qube, an empty set is returned. Volumes permanently
+    attached to a NON-running qube don't count as attached for this-- at
+    least, they shouldn't, and if they do, it's a bug (I haven't tested)."""
+    devnodes = set()
+    for dom in qapp.domains:
+        get_attached_blockdevs = \
+            getattr(dom.devices['block'], "get_attached_devices", None) or \
+            dom.devices['block'].attached
+        for blk in get_attached_blockdevs():
+            devnodes.add(blk.data['device_node'])
+    all_attached_zvols = set()
+    for devnode in devnodes:
+        try:
+            all_attached_zvols.add(run_cmd("/lib/udev/zvol_id",devnode).strip())
+        except subprocess.CalledProcessError:
+            pass
+
+    args = f"zfs list -H -o name -t volume -r {dataset}".split()
+    contained_zvols = set(run_cmd(*args).split())
+    return contained_zvols & all_attached_zvols
 
 class SubcommandsList():
     def __init__(self):
@@ -669,7 +761,9 @@ def get_cli_options():
 
     p = argparse.ArgumentParser(prog=cmd["name"])
     p.add_argument('-v', dest="verbose", action="store_true")
-    if 'file1' in cmd["tags"]:
+    if 'config_name' in cmd['tags']:
+        p.add_argument("config_name")
+    if 'file1' in cmd['tags']:
         p.add_argument("file1")
     opts = p.parse_args(sys.argv[2:])
 
@@ -702,11 +796,20 @@ def _import():
         msg = "Refusing to overwrite configuration of same name"
         raise MyError(msg, error_code='fatal')
     config.save()
+    print("Imported "+config.name)
 
 @subcmd()
 def _list():
     for c in Config.list_configs():
         print(*c)
+
+@subcmd('config_name')
+def _snapshot():
+    config = Config.load(options["config_name"])
+    try:
+        config.do_snapshots()
+    finally:
+        config.save()
 
 def main():
     try:
