@@ -15,6 +15,7 @@ ERROR_CODES = {
 }
 CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
+PRIMER_SUFFIX = "-primer"
 
 import sys, traceback, itertools, os, os.path, time, \
     argparse, re, subprocess, datetime, json
@@ -41,9 +42,9 @@ colours = types.SimpleNamespace(
 )
 
 warning_counter = 0
-def warn(msg, prefix="Warning :"):
+def warn(msg, prefix="Warning: ", count=1):
     global warning_counter
-    warning_counter += 1
+    warning_counter += count
     print(f"{colours.WARN}{prefix}{msg}{colours.RESET}", file=sys.stderr)
 
 def print_bg_msg(msg):
@@ -69,6 +70,40 @@ def run_cmd(*args, **kwargs):
         raise
 
     return p.stdout
+
+def human_readable_bytesize(num:int, field_w=18):
+    #I just needed something that works ok?
+    def commas(intd):
+        parts = []
+        while len(intd) > 3:
+            intd,p = intd[:-3],intd[-3:]
+            parts.append(p)
+        parts.append(intd)
+        return ','.join(reversed(parts))
+    if num < 0:
+        raise ValueError()
+    elif num < 10_000_000:
+        eh = commas(str(num))
+        return eh.rjust(field_w)
+    elif num < 1_100_000_000:
+        a = num / (1024**2)
+        b = round(a)
+        # b = round(a , (1 if a < 10 else 0))
+        c = commas(str(b)) + " M-- ---"
+        return c.rjust(field_w)
+    else:
+        a = num / (1024**3)
+        b = round(a, (1 if a < 10 else 0))
+        if b >= 10:
+            b = round(b)
+        c = str(b)
+        intd,dec,fracd = c.partition('.')
+        intd = commas(intd)
+        if dec == '.':
+            x = f"{intd}.{fracd[:1]} G --- ---"
+        else:
+            x = intd + " G-- --- ---"
+        return x.rjust(field_w)
 
 class MyError(Exception):
     def __init__(self, *args, error_code=None, **kwargs):
@@ -308,17 +343,21 @@ class Config():
     def do_snapshots(self):
         def ds_gen():
             for o in self.objects:
-                for ds_info in o["datasets"]:
-                    yield (ds_info['ds'], ds_info, o)
+                if o['role'] == 'include':
+                    for ds_info in o["datasets"]:
+                        yield (ds_info['ds'], ds_info, o)
         #
         deferred = 0
         target = self.user_config['scope']['target-snapshot']
+        snaps_allowed = self.user_config['scope']['allow-snapshot-creation']
         #
         for ds,ds_info,o in ds_gen():
             if ds_info['snap'] in ('unknown','blocked'):
                 self._check_on_snapshot_state(ds_info)
 
             # can we snap?
+            if not snaps_allowed:
+                continue
             if ds_info['snap'] != 'would':
                 continue
             if o['type'] == 'qubes':
@@ -338,22 +377,68 @@ class Config():
 
             # yes, snap
             snap_name = ds+target
-            primer_name = ds+target+"-primer"
-            prime = (( \
-                    self.user_config['scope']['since'] == 'beginning' and \
-                    self.user_config['scope']['progressive'] == False \
-                ) or options['always-prime']) \
-                and not libzfs_core.lzc_exists(primer_name.encode('ascii'))
-            if prime:
-                run_cmd(("zfs","snapshot",primer_name))
-            run_cmd(("zfs","snapshot","-r",snap_name))
-            print("snapshotted "+ds)
+            primer_name = snap_name+PRIMER_SUFFIX
+            if self.uses_primer or options['always-prime']:
+                if not libzfs_core.lzc_exists(primer_name.encode('ascii')):
+                    run_cmd("zfs","snapshot",primer_name)
+                ds_info['primer_label'] = target.removeprefix('@') + PRIMER_SUFFIX
+            run_cmd("zfs","snapshot","-r",snap_name)
             ds_info['snap'] = 'done'
+            print("snapshotted "+ds)
 
         self._print_snapshots_analysis()
         if deferred:
             warn(f"{deferred} deferred snapshots. Re-run the command once " \
-                "the preconditions are satisfied.")
+                "the preconditions are satisfied.", prefix='', count=0)
+
+    @property
+    def uses_primer(self):
+        return self.user_config['scope']['since'] == 'beginning' \
+            and self.user_config['scope']['progressive'] == False
+
+    def calculate_send(self):
+        calc_count = 0
+        unsnapped_count = 0
+        send_funcs = self._make_send_funcs('calc')
+
+        for ds_info in self.included_datasets:
+            if type(ds_info['size']) is int:
+                continue
+            if ds_info['snap'] not in ('done','yes'):
+                unsnapped_count += 1
+                continue
+
+            r = [f(ds_info) for f in send_funcs]
+            ds_info['size'] = sum(r)
+            ds_info['send_status'] = 'ready'
+            calc_count += 1
+
+        print(f"Calculated size of {calc_count} objects")
+        if unsnapped_count:
+            warn(f"{unsnapped_count} snapshots are missing. Calculations for " \
+                "those objects have been skipped.")
+        self._print_calc_result()
+
+    def test_receiver_ready(self):
+        raise NotImplementedError()
+
+    def do_send(self):
+        # receiver = self.user_config['receiver']['qube']
+        # dest_dataset = self.user_config['receiver']['dataset']
+        # try:
+        #     if not qapp.domains[receiver].is_running():
+        #         raise Exception(receiver+" isn't running")
+        # except KeyError:
+        #     raise Exception("receiver qube doesn't exist!")
+        # p = subprocess.run("qvm-run", receiver, f"zfs list {dest_dataset}", check=False)
+        # if p.returncode != 0:
+        #     raise Exception("Unable to confirm destination dataset " \
+        #         f"({dest_dataset}) exists in receiver qube.")
+        # printing status
+        # print("iiiiiiiiiiiiiiiiiiiiii", end='', flush=True)
+        # time.sleep(1)
+        # print("\rb", end='', flush=True)
+        raise NotImplementedError()
 
     @staticmethod
     def _parse_user_config(raw_config):
@@ -502,7 +587,10 @@ class Config():
         if o['role'] == "include":
             dataset_info = {
                 # "ds": <dataset name>,
-                "snap":"unknown",
+                "snap": "unknown",
+                "size": None,
+                "send_status": "notready",
+                "primer_label": None,
             }
         else:
             dataset_info = {}
@@ -606,9 +694,10 @@ class Config():
             return
         ds = ds_info['ds']
         target = self.user_config['scope']['target-snapshot'][1:]
-        args = f"zfs list -H -t snapshot -r {ds}".split()
+        args = f"zfs list -H -t snapshot -o name -s createtxg -r {ds}".split()
         snapshots = run_cmd(*args).splitlines()
         has_snap = 'no'
+        prev_label = None
         for snap in snapshots:
             sds,sep,label = snap.partition('@')
             assert sep == '@'
@@ -618,7 +707,20 @@ class Config():
                     break
                 else:
                     has_snap = 'descendant'
+            prev_label = label
         ds_info['snap'] = {'no':'would', 'descendant':'blocked', 'yes':'yes'}[has_snap]
+        if has_snap == 'yes':
+            if prev_label is None and self.uses_primer:
+                ds_info['snap'] = 'blocked'
+                warn(f"There are no previous snapshots to {ds}@{target} (to use " \
+                    "as a primer). This snapshot will remain blocked until it is" \
+                    "recreated with a primer.")
+            # it is not ideal when prev_label is a user-created snap that was
+            # not intended to be used as the primer. If it is very different
+            # from the target-snap we may end up sending a lot of unwanted
+            # data. But the result is acceptable in most cases, so let's not
+            # worry about it rn
+            ds_info['primer_label'] = prev_label
 
     def _print_snapshots_analysis(self):
         count = collections.Counter()
@@ -644,6 +746,62 @@ class Config():
     def _serialize(self):
         obj = dict((name, getattr(self,name)) for name in self.PERSISTENT)
         return json.dumps(obj, indent=2).encode('ascii', errors='strict')
+
+    def _make_send_funcs(self, mode):
+        since, progressive, target = [self.user_config['scope'][k] for k in \
+            ('since','progressive','target-snapshot')]
+        beginning = since == 'beginning'
+
+        base = ["zfs","send"]
+        mode_args = {'calc':["--dryrun","-P"], 'send':[]}[mode]
+        # primer args
+        a0 = ["-p", "{ds}" + since]
+        # target-snapshot args
+        a1 = ["-R"]
+        if not (beginning and progressive):
+            a1 += [("-i","-I")[int(progressive)]]
+            a1 += ["{ds}" + ("@{primer_label}",since)[int(beginning)]]
+        a1 += ["{ds}"+target]
+        skip_primer = int(not self.uses_primer)
+        command_templs = [(base+mode_args+a) for a in [a0,a1][skip_primer:]]
+
+        def run_get_size(*cmd):
+            out = run_cmd(*cmd)
+            for l in out.splitlines():
+                fields = l.split()
+                if fields[:1] == ["size"]:
+                    return int(fields[1])
+            raise Exception("size not found")
+        print(command_templs)
+
+        run = {
+            'calc': run_get_size,
+            'send': run_cmd,
+        }[mode]
+
+        def make(templ):
+            def f(ds_info):
+                cmd = [arg.format(**ds_info) for arg in templ]
+                return run(*cmd)
+            return f
+
+        return [make(templ) for templ in command_templs]
+
+    def _print_calc_result(self):
+        total = 0
+        skipped = 0
+        print("\nsend size:")
+        for ds_info in self.included_datasets:
+            sz = ds_info['size']
+            if type(sz) is int:
+                print(human_readable_bytesize(sz), ds_info['ds'])
+                total += sz
+            else:
+                skipped += 1
+        if not skipped:
+            print(human_readable_bytesize(total),"(total)")
+        else:
+            warn("There are uncalculated datasets. Results are incomplete.")
 
 def zfs_ancestors_iter(ds):
     while True:
@@ -782,6 +940,9 @@ def _check():
             "so importing with that name will fail.")
     else:
         print("Configuration can be imported")
+    if config.user_config['receiver']['qube'] not in qapp.domains:
+        warn(f"Receiving qube {config.user_config['receiver']['qube']} does not " \
+            "exist and will need to be created before a send can be initiated.")
 
 @subcmd('file1')
 def _import():
@@ -808,6 +969,22 @@ def _snapshot():
     config = Config.load(options["config_name"])
     try:
         config.do_snapshots()
+    finally:
+        config.save()
+
+@subcmd('config_name')
+def _calc():
+    config = Config.load(options["config_name"])
+    try:
+        config.calculate_send()
+    finally:
+        config.save()
+
+@subcmd('config_name')
+def _send():
+    config = Config.load(options["config_name"])
+    try:
+        config.do_send()
     finally:
         config.save()
 
