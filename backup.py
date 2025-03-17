@@ -12,6 +12,7 @@ ERROR_CODES = {
     "fatal": 2,# all fully-unhandled errors go here
     "yaml": 3,
     "notfound": 4,# only when specifying non-existant files on the command line
+    "receiver": 7,
 }
 CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
@@ -20,6 +21,8 @@ PRIMER_SUFFIX = "-primer"
 import sys, traceback, itertools, os, os.path, time, \
     argparse, re, subprocess, datetime, json
 import types, collections, collections.abc
+from collections.abc import Callable
+import asyncio
 chain_iter = itertools.chain.from_iterable
 #from copy import deepcopy
 import qubesadmin
@@ -131,7 +134,7 @@ class MyError(Exception):
         return self.args_str
 
 class ConfigError(MyError):
-    error_code = ERROR_CODES["input"]
+    error_code = ERROR_CODES['input']
 
     def __init__(self):
         self.verrs = []
@@ -148,6 +151,9 @@ class ConfigError(MyError):
 
     def __bool__(self):
         return bool(self.verrs)
+
+class ReceiverError(MyError):
+    error_code = ERROR_CODES['receiver']
 
 class ConfigHeader(collections.abc.Mapping):
     FIELD_TERM_CHAR = b';'
@@ -247,7 +253,7 @@ class ConfigHeader(collections.abc.Mapping):
         return dict(items)
 
 class Config():
-    PERSISTENT = ('user_config','raw_user_config', 'objects')
+    PERSISTENT = ('user_config', 'raw_user_config', 'objects')
 
     @classmethod
     def import_(cls, filename):
@@ -413,27 +419,23 @@ class Config():
             ds_info['send_status'] = 'ready'
             calc_count += 1
 
-        print(f"Calculated size of {calc_count} objects")
+        if calc_count:
+            print(f"Calculated size of {calc_count} objects")
         if unsnapped_count:
             warn(f"{unsnapped_count} snapshots are missing. Calculations for " \
                 "those objects have been skipped.")
         self._print_calc_result()
 
-    def test_receiver_ready(self):
-        raise NotImplementedError()
-
     def do_send(self):
-        # receiver = self.user_config['receiver']['qube']
-        # dest_dataset = self.user_config['receiver']['dataset']
-        # try:
-        #     if not qapp.domains[receiver].is_running():
-        #         raise Exception(receiver+" isn't running")
-        # except KeyError:
-        #     raise Exception("receiver qube doesn't exist!")
-        # p = subprocess.run("qvm-run", receiver, f"zfs list {dest_dataset}", check=False)
-        # if p.returncode != 0:
-        #     raise Exception("Unable to confirm destination dataset " \
-        #         f"({dest_dataset}) exists in receiver qube.")
+        receiver = Receiver(self.user_config['receiver']['qube'])
+        dest_dataset = self.user_config['receiver']['dataset']
+        if not receiver.dataset_exists(dest_dataset):
+            raise ReceiverError("Unable to confirm destination dataset " \
+                f"({self.dest_dataset}) exists in receiver qube.")
+
+        # send_funcs = self._make_send_funcs('send')
+        #
+
         # printing status
         # print("iiiiiiiiiiiiiiiiiiiiii", end='', flush=True)
         # time.sleep(1)
@@ -772,7 +774,6 @@ class Config():
                 if fields[:1] == ["size"]:
                     return int(fields[1])
             raise Exception("size not found")
-        print(command_templs)
 
         run = {
             'calc': run_get_size,
@@ -802,6 +803,95 @@ class Config():
             print(human_readable_bytesize(total),"(total)")
         else:
             warn("There are uncalculated datasets. Results are incomplete.")
+
+class Receiver():
+    def __init__(self, qube):
+        self.qube = qube
+        try:
+            if not qapp.domains[self.qube].is_running():
+                raise ReceiverError(self.qube+" isn't running")
+        except KeyError:
+            raise ReceiverError("receiver qube doesn't exist!")
+
+    def dataset_exists(self, dataset):
+        args = ["qvm-run", self.qube, "--", "zfs", "list", dataset]
+        track_commandline(args)
+        p = subprocess.run(args, check=False)
+        return p.returncode == 0
+
+    @staticmethod
+    def new_job_status():
+        return {"bytes_sent": 0, "secs_elapsed": 0}
+
+    async def stream_to(self, local_cmd, recv_cmd, status=None,
+                        progress_cb:Callable[[dict], None] = (lambda x: None)):
+        if not all(
+            (isinstance(c, collections.abc.Sequence) and not isinstance(c, str))
+            for c in (local_cmd, recv_cmd)
+        ): raise TypeError()
+        if status is None:
+            status = self.new_job_status()
+        status_ref_time = float(status['secs_elapsed'])
+        enter_time = time.time()
+
+        def update_status(sz=0):
+            status['bytes_sent'] += sz
+            status['secs_elapsed'] = (time.time() - enter_time) + status_ref_time
+            progress_cb(status)
+            return status
+
+        async def status_update_on_interval():
+            interval = 0.2
+            # reference time is offset by half of interval to avoid having
+            # status['secs_elapsed'] land too close to whole numbers (which could
+            # give the appearance of a buggy clock if progress callback is
+            # used to print whole seconds).
+            ref_time = enter_time - (status_ref_time-int(status_ref_time)) + (interval/2)
+            t = enter_time
+            while True:
+                # Interval alignment is always based on ref_time. But if somehow
+                # an entire interval is missed, we don't try to immediately
+                # iterate twice to "catch up"-- the second iter simply doesn't happen.
+                await asyncio.sleep(((ref_time - t) % interval) + 0.000001)
+                t = time.time()
+                status['secs_elapsed'] = (t - enter_time) + status_ref_time
+                progress_cb(status)
+
+        read_limit = 1024 ** 2
+        local_proc, recv_proc = await asyncio.gather(
+            asyncio.create_subprocess_exec(
+                *local_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                limit=(2 * read_limit),
+            ),
+            asyncio.create_subprocess_exec(
+                "/usr/bin/qvm-run", "--pass-io", "--no-auto", "--no-shell",
+                "--no-colour-output", "--no-colour-stderr", "--filter-escape-chars",
+                self.qube, "--", *recv_cmd,
+                stdin=asyncio.subprocess.PIPE,
+            )
+        )
+
+        status_idle_task = asyncio.create_task(status_update_on_interval())
+        out = b''
+        while True:
+            update_status(len(out))
+            out = await local_proc.stdout.read(read_limit)
+            await recv_proc.stdin.drain()
+            if not out:
+                break
+            recv_proc.stdin.write(out)
+
+        status_idle_task.cancel()
+        recv_proc.stdin.close()
+        await recv_proc.stdin.wait_closed()
+        await asyncio.wait(
+            (asyncio.create_task(local_proc.wait()),
+            asyncio.create_task(recv_proc.wait()),
+            status_idle_task)
+        )
+
+        return update_status()
 
 def zfs_ancestors_iter(ds):
     while True:
@@ -987,6 +1077,16 @@ def _send():
         config.do_send()
     finally:
         config.save()
+
+@subcmd()
+def _dev_stream_test():
+    options['verbose'] = True
+    r = Receiver("backups-disp")
+    # print(r.dataset_exists("heeee"))
+    print("hi")
+    x = r.stream_to(["/root/backup_test/lil-outputter"],
+        ["cat"], progress_cb=lambda s: print(s["secs_elapsed"]))
+    asyncio.run(x)
 
 def main():
     try:
