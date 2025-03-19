@@ -13,6 +13,7 @@ ERROR_CODES = {
     "yaml": 3,
     "notfound": 4,# only when specifying non-existant files on the command line
     "receiver": 7,
+    "send": 8,
 }
 CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
@@ -20,7 +21,7 @@ PRIMER_SUFFIX = "-primer"
 
 import sys, traceback, itertools, os, os.path, time, \
     argparse, re, subprocess, datetime, json
-import types, collections, collections.abc
+import types, collections, collections.abc, functools
 from collections.abc import Callable
 import asyncio
 chain_iter = itertools.chain.from_iterable
@@ -107,6 +108,33 @@ def human_readable_bytesize(num:int, field_w=18):
         else:
             x = intd + " G-- --- ---"
         return x.rjust(field_w)
+
+class AdvanceableChainIter():
+    def __init__(self, *its):
+        self.stop = None
+        self.its = iter(its)
+        self.advance()
+
+    def advance(self):
+        if self.stop is not None:
+            return
+        try:
+            self.cur_item = next(self.its)
+        except StopIteration as e:
+            self.stop = e
+        else:
+            self.cur_it = iter(self.cur_item)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while self.stop is None:
+            try:
+                return next(self.cur_it)
+            except StopIteration:
+                self.advance()
+        raise self.stop
 
 class MyError(Exception):
     def __init__(self, *args, error_code=None, **kwargs):
@@ -323,15 +351,10 @@ class Config():
         r.sort()
         return r
 
-    @property
+    @functools.cached_property
     def included_datasets(self):
-        try:
-            r = self._included_datasets
-        except:
-            r = self._included_datasets = list(
-                chain_iter(o['datasets'] for o in self.objects if o['role'] == 'include')
-            )
-        return r
+        x = (o['datasets'] for o in self.objects if o['role'] == 'include')
+        return list(chain_iter(x))
 
     def get_graph(self):
         try:
@@ -405,7 +428,7 @@ class Config():
     def calculate_send(self):
         calc_count = 0
         unsnapped_count = 0
-        send_funcs = self._make_send_funcs('calc')
+        send_cmd_makers = self._make_send_cmd_makers('calc')
 
         for ds_info in self.included_datasets:
             if type(ds_info['size']) is int:
@@ -414,8 +437,26 @@ class Config():
                 unsnapped_count += 1
                 continue
 
-            r = [f(ds_info) for f in send_funcs]
-            ds_info['size'] = sum(r)
+            @functools.cache
+            def receiver():
+                return Receiver(**self.user_config['receiver'], user="user")
+
+            sz = 0
+            for mk_cmd in send_cmd_makers:
+                if mk_cmd.is_primer:
+                    # will we actually need to send it?
+                    dest = f"{receiver().dest_dataset}/{ds_info['ds']}@{ds_info['primer_label']}"
+                    if receiver().dataset_exists(dest):
+                        continue
+                out = run_cmd(*mk_cmd(**ds_info))
+                for l in out.splitlines():
+                    fields = l.split()
+                    if fields[:1] == ["size"]:
+                        sz += int(fields[1])
+                        break
+                else:
+                    raise Exception("size not found")
+            ds_info['size'] = sz
             ds_info['send_status'] = 'ready'
             calc_count += 1
 
@@ -426,21 +467,99 @@ class Config():
                 "those objects have been skipped.")
         self._print_calc_result()
 
-    def do_send(self):
-        receiver = Receiver(self.user_config['receiver']['qube'])
-        dest_dataset = self.user_config['receiver']['dataset']
-        if not receiver.dataset_exists(dest_dataset):
-            raise ReceiverError("Unable to confirm destination dataset " \
-                f"({self.dest_dataset}) exists in receiver qube.")
+    def do_send(self, *, complete_send_only=True):
+        total_bytes = 0
+        initial_sent_bytes = 0
+        datasets_ready = []
+        datasets_interrupted = []
+        for ds_info in self.included_datasets:
+            s = ds_info['send_status']
+            if ds_info['send_status'] != 'notready':
+                total_bytes += ds_info['size']
+                match ds_info['send_status']:
+                    case 'ready':
+                        datasets_ready.append(ds_info)
+                    case 'interrupted':
+                        datasets_interrupted.append(ds_info)
+                    case 'done':
+                        initial_sent_bytes += ds_info['size']
+            elif complete_send_only:
+                raise Exception("can't send: previous phases are incomplete")
 
-        # send_funcs = self._make_send_funcs('send')
-        #
+        datasets_iter = AdvanceableChainIter(datasets_interrupted, datasets_ready)
+        local_send_cmd_makers = self._make_send_cmd_makers('send')
+        exceptions = []
+        receiver = Receiver(**self.user_config['receiver'])
+        transfer_metrics = receiver.new_transfer_metrics()
+        transfer_metrics['bytes_sent'] = initial_sent_bytes
 
-        # printing status
-        # print("iiiiiiiiiiiiiiiiiiiiii", end='', flush=True)
-        # time.sleep(1)
-        # print("\rb", end='', flush=True)
-        raise NotImplementedError()
+        def progress_backspace(flush=False):
+            print('\r', ' '*40, '\r', sep='', end='', flush=flush)
+
+        def progress_print(*args):
+            progress_backspace()
+            print(transfer_metrics['bytes_sent'], '/', total_bytes,
+                end='', flush=True)
+
+        # desired free space kinda arbitrary; I just picked what felt right
+        # idk what kind of storage overhead actually exists, if any
+        if (int(total_bytes * 1.02) + 2**17) > receiver.get_space_avail():
+            raise ReceiverError("Receiver does not have enough free space")
+
+        for ds_info in datasets_iter:
+            for mk_local_cmd in local_send_cmd_makers:
+                local_cmd = mk_local_cmd(**ds_info)
+
+                if mk_local_cmd.is_primer:
+                    snap_segment = '@' + ds_info['primer_label']
+                else:
+                    snap_segment = self.user_config['scope']['target-snapshot']
+                dest_snap = receiver.dest_dataset +'/'+ ds_info['ds'] + snap_segment
+                dest_parent, dest_snap_shortname = dest_snap.rsplit('/', maxsplit=1)
+
+                try:
+                    if receiver.dataset_exists(dest_snap):
+                        if mk_local_cmd.is_primer:
+                            continue
+                        else:
+                            raise ReceiverError("Destination snapshot already exists")
+
+                    # create parent container if it doesn't exist
+                    receiver.run_cmd(*("zfs create -p -u".split()), dest_parent)
+
+                    # send! HOORAY!
+                    print("sending", local_cmd[-1])
+                    send = receiver.stream_to(
+                        local_cmd,
+                        ["zfs", "receive", "-e", "-u", dest_parent],
+                        transfer_metrics, progress_print
+                    )
+                    asyncio.run(send)
+
+                    if options['verbose']:
+                        print("\nOK")
+                    else:
+                        time.sleep(0.2)
+                        progress_backspace(True)
+
+                except Exception as e:
+                    print(f"{colours.ERR}{e}{colours.RESET}", file=sys.stderr)
+                    exceptions += [f"error while attempting to send {ds_info['ds']}", e]
+                    ds_info['send_status'] = 'interrupted'
+                    #
+                    datasets_iter.advance()
+                    break
+
+            ds_info['send_status'] = 'done'
+
+        sent = transfer_metrics['bytes_sent'] - initial_sent_bytes
+        if sent:
+            print("sent " + human_readable_bytesize(sent).strip(' -'))
+        if exceptions:
+            print(f"{colours.ERR}send failed{colours.RESET}", file=sys.stderr)
+            raise MyError(*exceptions, error_code='send')
+        else:
+            print("send completed successfully!")
 
     @staticmethod
     def _parse_user_config(raw_config):
@@ -749,7 +868,7 @@ class Config():
         obj = dict((name, getattr(self,name)) for name in self.PERSISTENT)
         return json.dumps(obj, indent=2).encode('ascii', errors='strict')
 
-    def _make_send_funcs(self, mode):
+    def _make_send_cmd_makers(self, mode):
         since, progressive, target = [self.user_config['scope'][k] for k in \
             ('since','progressive','target-snapshot')]
         beginning = since == 'beginning'
@@ -757,36 +876,25 @@ class Config():
         base = ["zfs","send"]
         mode_args = {'calc':["--dryrun","-P"], 'send':[]}[mode]
         # primer args
-        a0 = ["-p", "{ds}" + since]
+        a0 = ["-p", "{ds}@{primer_label}"]
         # target-snapshot args
         a1 = ["-R"]
         if not (beginning and progressive):
             a1 += [("-i","-I")[int(progressive)]]
-            a1 += ["{ds}" + ("@{primer_label}",since)[int(beginning)]]
+            a1 += ["{ds}" + (since,"@{primer_label}")[int(beginning)]]
         a1 += ["{ds}"+target]
-        skip_primer = int(not self.uses_primer)
-        command_templs = [(base+mode_args+a) for a in [a0,a1][skip_primer:]]
+        command_templs = [(base+mode_args+a) for a in (a0,a1)]
 
-        def run_get_size(*cmd):
-            out = run_cmd(*cmd)
-            for l in out.splitlines():
-                fields = l.split()
-                if fields[:1] == ["size"]:
-                    return int(fields[1])
-            raise Exception("size not found")
-
-        run = {
-            'calc': run_get_size,
-            'send': run_cmd,
-        }[mode]
-
-        def make(templ):
-            def f(ds_info):
-                cmd = [arg.format(**ds_info) for arg in templ]
-                return run(*cmd)
+        def make(phase, templ):
+            def f(**ctx):
+                cmd = [arg.format(**ctx) for arg in templ]
+                return cmd
+            f.phase = phase
+            f.is_primer = phase == 0
             return f
 
-        return [make(templ) for templ in command_templs]
+        maker_specs = list(enumerate(command_templs))[int(not self.uses_primer):]
+        return [make(i,templ) for i,templ in maker_specs]
 
     def _print_calc_result(self):
         total = 0
@@ -805,48 +913,92 @@ class Config():
             warn("There are uncalculated datasets. Results are incomplete.")
 
 class Receiver():
-    def __init__(self, qube):
+    OUTPUT_ARGS = ["--pass-io", "--no-colour-output",
+        "--no-colour-stderr", "--filter-escape-chars"]
+    NULL_DATASET = object()
+
+    def __init__(self, qube, dataset, user="root"):
         self.qube = qube
+        self.dest_dataset = dataset
+        self.user = user
         try:
             if not qapp.domains[self.qube].is_running():
                 raise ReceiverError(self.qube+" isn't running")
         except KeyError:
             raise ReceiverError("receiver qube doesn't exist!")
+        if not (dataset is self.NULL_DATASET or self.dataset_exists(dataset)):
+            raise ReceiverError("Unable to confirm destination dataset " \
+                f"({self.dest_dataset}) exists in receiver qube.")
+
+    def run_cmd(self, *cmd, **kwargs):
+        if len(cmd) == 0:
+            raise ValueError()
+        args = ["qvm-run", "--no-auto", "--no-shell", f"--user={self.user}", \
+            *self.OUTPUT_ARGS, self.qube, "--", *cmd]
+        track_commandline(args)
+        p = subprocess.run(args, capture_output=True, text=True, **kwargs)
+        if "check" not in kwargs:
+            if p.stderr:
+                print_bg_msg(p.stderr)
+            p.check_returncode()
+        return p
+
+    def run_bool_shellcmd(self, shellcmd:str, falsecodes=range(1,126), **kwargs):
+        # this func exists because boolean results need to be done with
+        # shell commands, because the alternative (qubes.VMExec I think?)
+        # doesn't give the real return code. That would limit our ability
+        # in some cases to differentiate an actual "false" result from
+        # the command, vs. an error from qvm-run or failure of the vm to
+        # call the cmd.
+        args = ["qvm-run", "--no-auto", f"--user={self.user}"] \
+            + [self.qube, "--", shellcmd]
+        track_commandline(args)
+        p = subprocess.run(args, stderr=subprocess.PIPE, **kwargs)
+
+        if p.returncode == 0:
+            return True
+        regex = rb"(\n|^)qvm-run\W+error"
+        if p.returncode not in falsecodes or re.search(regex, p.stderr):
+            print_bg_msg(p.stderr.decode())
+            p.check_returncode()
+        return False
 
     def dataset_exists(self, dataset):
-        args = ["qvm-run", self.qube, "--", "zfs", "list", dataset]
-        track_commandline(args)
-        p = subprocess.run(args, check=False)
-        return p.returncode == 0
+        return self.run_bool_shellcmd("zfs list "+dataset)
+
+    def get_space_avail(self):
+        args = "zfs list -H -p -o avail".split() + [self.dest_dataset]
+        p = self.run_cmd(*args)
+        return int(p.stdout)
 
     @staticmethod
-    def new_job_status():
+    def new_transfer_metrics():
         return {"bytes_sent": 0, "secs_elapsed": 0}
 
-    async def stream_to(self, local_cmd, recv_cmd, status=None,
+    async def stream_to(self, local_cmd, recv_cmd, metrics=None,
                         progress_cb:Callable[[dict], None] = (lambda x: None)):
         if not all(
             (isinstance(c, collections.abc.Sequence) and not isinstance(c, str))
             for c in (local_cmd, recv_cmd)
         ): raise TypeError()
-        if status is None:
-            status = self.new_job_status()
-        status_ref_time = float(status['secs_elapsed'])
+        if metrics is None:
+            metrics = self.new_transfer_metrics()
+        metrics_ref_time = float(metrics['secs_elapsed'])
         enter_time = time.time()
 
-        def update_status(sz=0):
-            status['bytes_sent'] += sz
-            status['secs_elapsed'] = (time.time() - enter_time) + status_ref_time
-            progress_cb(status)
-            return status
+        def update_metrics(sz=0):
+            metrics['bytes_sent'] += sz
+            metrics['secs_elapsed'] = (time.time() - enter_time) + metrics_ref_time
+            progress_cb(metrics)
+            return metrics
 
-        async def status_update_on_interval():
+        async def metrics_update_on_interval():
             interval = 0.2
             # reference time is offset by half of interval to avoid having
-            # status['secs_elapsed'] land too close to whole numbers (which could
+            # metrics['secs_elapsed'] land too close to whole numbers (which could
             # give the appearance of a buggy clock if progress callback is
             # used to print whole seconds).
-            ref_time = enter_time - (status_ref_time-int(status_ref_time)) + (interval/2)
+            ref_time = enter_time - (metrics_ref_time-int(metrics_ref_time)) + (interval/2)
             t = enter_time
             while True:
                 # Interval alignment is always based on ref_time. But if somehow
@@ -854,8 +1006,8 @@ class Receiver():
                 # iterate twice to "catch up"-- the second iter simply doesn't happen.
                 await asyncio.sleep(((ref_time - t) % interval) + 0.000001)
                 t = time.time()
-                status['secs_elapsed'] = (t - enter_time) + status_ref_time
-                progress_cb(status)
+                metrics['secs_elapsed'] = (t - enter_time) + metrics_ref_time
+                progress_cb(metrics)
 
         read_limit = 1024 ** 2
         local_proc, recv_proc = await asyncio.gather(
@@ -865,33 +1017,32 @@ class Receiver():
                 limit=(2 * read_limit),
             ),
             asyncio.create_subprocess_exec(
-                "/usr/bin/qvm-run", "--pass-io", "--no-auto", "--no-shell",
-                "--no-colour-output", "--no-colour-stderr", "--filter-escape-chars",
-                self.qube, "--", *recv_cmd,
+                "/usr/bin/qvm-run", "--no-auto", "--no-shell", f"--user={self.user}",
+                *self.OUTPUT_ARGS, self.qube, "--", *recv_cmd,
                 stdin=asyncio.subprocess.PIPE,
             )
         )
 
-        status_idle_task = asyncio.create_task(status_update_on_interval())
+        metrics_idle_task = asyncio.create_task(metrics_update_on_interval())
         out = b''
         while True:
-            update_status(len(out))
+            update_metrics(len(out))
             out = await local_proc.stdout.read(read_limit)
             await recv_proc.stdin.drain()
             if not out:
                 break
             recv_proc.stdin.write(out)
 
-        status_idle_task.cancel()
+        metrics_idle_task.cancel()
         recv_proc.stdin.close()
         await recv_proc.stdin.wait_closed()
         await asyncio.wait(
             (asyncio.create_task(local_proc.wait()),
             asyncio.create_task(recv_proc.wait()),
-            status_idle_task)
+            metrics_idle_task)
         )
 
-        return update_status()
+        return update_metrics()
 
 def zfs_ancestors_iter(ds):
     while True:
@@ -1081,11 +1232,11 @@ def _send():
 @subcmd()
 def _dev_stream_test():
     options['verbose'] = True
-    r = Receiver("backups-disp")
+    r = Receiver("backups-disp",Receiver.NULL_DATASET,user="user")
     # print(r.dataset_exists("heeee"))
     print("hi")
     x = r.stream_to(["/root/backup_test/lil-outputter"],
-        ["cat"], progress_cb=lambda s: print(s["secs_elapsed"]))
+        ["md5sum"], progress_cb=lambda s: print(s["secs_elapsed"]))
     asyncio.run(x)
 
 def main():
