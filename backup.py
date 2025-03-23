@@ -1,12 +1,17 @@
 #!/usr/bin/python3
 
 options = {
-    "metadata_dir": "/root/backup_test/metadata",
-    # verbose is here so it can have a value at program-initialization time
+    # metadata_dir is where imported configs are stored. It can be an
+    # absolute path, or a path relative to this program's location
+    "metadata_dir": "metadata",
+    # verbose is here so it can have a value at program-initialization time;
     # gets overwritten by cli opts early on
     "verbose": True,
     "always-prime": True,
 }
+
+VERSION = 0
+PROGRAM_DESCRIPTION = "a backups and snapshots tool for QubesOS+ZFS systems"
 ERROR_CODES = {
     "input": 1,
     "fatal": 2,# all fully-unhandled errors go here
@@ -19,13 +24,19 @@ CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
 PRIMER_SUFFIX = "-primer"
 
+# libraries reference:
+# qubesadmin:
+# https://dev.qubes-os.org/projects/core-admin-client/en/latest/py-modindex.html
+# libzfs_core:
+# https://pyzfs.readthedocs.io/en/latest/index.html
+#
 import sys, traceback, itertools, os, os.path, time, \
     argparse, re, subprocess, datetime, json
 import types, collections, collections.abc, functools
 from collections.abc import Callable
 import asyncio
 chain_iter = itertools.chain.from_iterable
-#from copy import deepcopy
+#
 import qubesadmin
 qapp = qubesadmin.Qubes()
 import libzfs_core
@@ -44,6 +55,14 @@ colours = types.SimpleNamespace(
     BOLD = '\x1b[1m',
     RESET = '\x1b[0m'
 )
+
+apparent_command_name = os.path.basename(sys.argv[0])
+real_command_dir, real_command_name = \
+    os.path.split(os.path.realpath(sys.argv[0], strict=True))
+if not options['metadata_dir'].startswith('/'):
+    options['metadata_dir'] = os.path.join(real_command_dir, options['metadata_dir'])
+
+
 
 warning_counter = 0
 def warn(msg, prefix="Warning: ", count=1):
@@ -943,13 +962,29 @@ class Receiver():
             p.check_returncode()
         return p
 
-    def run_bool_shellcmd(self, shellcmd:str, falsecodes=range(1,126), **kwargs):
+    def run_bool_shellcmd(self, shellcmd:str, falsecodes=range(1,125), **kwargs):
         # this func exists because boolean results need to be done with
         # shell commands, because the alternative (qubes.VMExec I think?)
-        # doesn't give the real return code. That would limit our ability
-        # in some cases to differentiate an actual "false" result from
-        # the command, vs. an error from qvm-run or failure of the vm to
-        # call the cmd.
+        # doesn't give the real return code (could be a bug?). That would
+        # limit our ability in some cases to differentiate an actual "false"
+        # result from the command, vs. an error from qvm-run or failure of
+        # the vm to call the cmd.
+        # p.s.: qvm-run decides which service to call in 
+        # https://github.com/QubesOS/qubes-core-admin-client/blob/main/
+        # qubesadmin/tools/qvm_run.py in the run_command_single function.
+        #
+        # falsecodes : return codes which should be considered a "false"
+        # response from the shell command. It should never include the
+        # following known non-false codes:
+        # 0: success, obviously
+        # 125: QREXEC_EXIT_PROBLEM "Problem with qrexec itself". Reference:
+        #      reference: https://github.com/QubesOS/qubes-core-qrexec/blob/
+        #                 96813fdde17e85477ca8fd2e644cbc298053f32d/libqrexec
+        #                 /qrexec.h#L182
+        # 126: QREXEC_EXIT_REQUEST_REFUSED
+        # 127: Command not found error
+        # <0 or >127: Process aborted early by a signal
+
         args = ["qvm-run", "--no-auto", f"--user={self.user}"] \
             + [self.qube, "--", shellcmd]
         track_commandline(args)
@@ -1052,6 +1087,7 @@ def zfs_ancestors_iter(ds):
         yield ds
 
 def qubesd_query(call, dest, arg=None):
+    # usage reference: https://www.qubes-os.org/doc/admin-api/
     args = ["qubesd-query","-e","dom0",call,dest,*([arg] if arg is not None else [])]
     track_commandline(args)
     p = subprocess.run(args, capture_output=True)
@@ -1156,9 +1192,24 @@ subcommands = SubcommandsList()
 subcmd = subcommands.get_add_decorator
 
 def get_cli_options():
-    cmd = subcommands.by_name[sys.argv[1]]
+    def error(msg):
+        options['verbose'] = False
+        raise MyError(msg, error_code='input')
 
-    p = argparse.ArgumentParser(prog=cmd["name"])
+    if len(sys.argv) == 1:
+        error(f"Use '{apparent_command_name} help' for help.")
+    elif sys.argv[1:] in (["-h"],["--help"]):
+        cmd_name = 'help'
+    else:
+        cmd_name = sys.argv[1]
+        if cmd_name.startswith('-'):
+            error("No command specified")
+        elif cmd_name not in subcommands.by_name:
+            error(f"Command '{cmd_name}' doesn't exist.")
+
+    cmd = subcommands.by_name[cmd_name]
+
+    p = argparse.ArgumentParser(prog=f"{apparent_command_name} {cmd['name']}")
     p.add_argument('-v', dest="verbose", action="store_true")
     if 'config_name' in cmd['tags']:
         p.add_argument("config_name")
@@ -1172,8 +1223,13 @@ def get_cli_options():
 
 ###################################################################
 
-@subcmd('file1')
+@subcmd('backupcmd','file1')
 def _check():
+    """\
+    Performs validation on a new user-provided configuration prior to importing.
+    The user should study the output carefully to catch any configuration
+    mistakes, and recheck if revisions are made.
+    """
     config = Config.import_(options["file1"])
     config.print_import_analysis()
     if config.name in Config.all_config_names():
@@ -1185,8 +1241,13 @@ def _check():
         warn(f"Receiving qube {config.user_config['receiver']['qube']} does not " \
             "exist and will need to be created before a send can be initiated.")
 
-@subcmd('file1')
+@subcmd('backupcmd','file1')
 def _import():
+    """\
+    Imports the user's configuration into the program's internal store.
+    Configurations must be imported before they can be operated on
+    (snapshotting, sending, etc.).
+    """
     if not os.path.isdir(options["metadata_dir"]):
         e = FileNotFoundError(options["metadata_dir"])
         msg = "options.metadata_dir is not valid; you may " \
@@ -1200,34 +1261,113 @@ def _import():
     config.save()
     print("Imported "+config.name)
 
-@subcmd()
-def _list():
-    for c in Config.list_configs():
-        print(*c)
-
-@subcmd('config_name')
+@subcmd('backupcmd', 'config_name')
 def _snapshot():
+    """\
+    Creates the configuration's target snapshot.
+    """
     config = Config.load(options["config_name"])
     try:
         config.do_snapshots()
     finally:
         config.save()
 
-@subcmd('config_name')
+@subcmd('backupcmd', 'config_name')
 def _calc():
+    """\
+    Calculates size of the eventual send, and performs some final checks before
+    the send.
+    """
     config = Config.load(options["config_name"])
     try:
         config.calculate_send()
     finally:
         config.save()
 
-@subcmd('config_name')
+@subcmd('backupcmd', 'config_name')
 def _send():
+    """\
+    Copies the included set to the receiver qube. If it succeeds, the backup
+    process is complete.
+    """
     config = Config.load(options["config_name"])
     try:
         config.do_send()
     finally:
         config.save()
+
+@subcmd('infocmd')
+def _list():
+    """\
+    Lists all imported configurations
+    """
+    for c in Config.list_configs():
+        print(*c)
+
+@subcmd('infocmd')
+def _help():
+    """Prints command list"""
+    from textwrap import dedent
+    indent = ' '*4
+    vspace = ''
+
+    # define command groups
+    groups = [
+        {
+            "cmds": [],
+            "head": "Backup user commands:\n"+indent+"To perform a backup, "
+                    "each of these should be called sequentially.",
+            "member_test": (lambda c: 'backupcmd' in c['tags']),
+            "number": True,
+            "show": "yes",
+        },
+        {
+            "cmds": [],
+            "head": "Informational user commands:",
+            "member_test": (lambda c: 'infocmd' in c['tags']),
+            "number": False,
+            "show": "yes",
+        },
+        {
+            "cmds": [],
+            "head": "Non-user commands:",
+            "member_test": (lambda c: True),
+            "number": False,
+            "show": "verbose",
+        },
+    ]
+    for cmd in subcommands:
+        for g in groups:
+            if g['member_test'](cmd):
+                g['cmds'].append(cmd)
+                break
+
+    # print help
+    print()
+    print(f"Usage: {apparent_command_name} <command> [-hv] [<options>...]\n")
+    description = PROGRAM_DESCRIPTION[0].upper() + PROGRAM_DESCRIPTION[1:].rstrip('.')
+    print(indent + description + ".\n")
+
+    print("Global options:" + vspace)
+    print(indent + "-h           show command-specific help information")
+    print(indent + "-v           verbose mode")
+    print()
+
+    for g in groups:
+        if g['show'] == 'no' or (g['show'] == 'verbose' and not options['verbose']):
+            continue
+
+        print(g['head'] + vspace)
+        for i,cmd in enumerate(g['cmds'], start=1):
+            enum = (str(i)+'. ') if g['number'] else ''
+            name = colours.BOLD + cmd['name'] + colours.RESET
+            padding = ' ' * max(0,8-len(cmd['name']))
+            doc = ' '.join(dedent(cmd['help'] or '?').split('\n'))
+
+            print(f"{indent}{enum}{name}{padding} - {doc}{vspace}")
+        print()
+
+    options['verbose'] = False
 
 @subcmd()
 def _dev_stream_test():
