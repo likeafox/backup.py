@@ -519,14 +519,7 @@ class Config():
         receiver = Receiver(**self.user_config['receiver'])
         transfer_metrics = receiver.new_transfer_metrics()
         transfer_metrics['bytes_sent'] = initial_sent_bytes
-
-        def progress_backspace(flush=False):
-            print('\r', ' '*40, '\r', sep='', end='', flush=flush)
-
-        def progress_print(*args):
-            progress_backspace()
-            print(transfer_metrics['bytes_sent'], '/', total_bytes,
-                end='', flush=True)
+        progress = ProgressBar(total_bytes)
 
         # don't exit haphazardly if the program is interrupted (set signal handlers)
         signame = None
@@ -596,7 +589,7 @@ class Config():
                     send = receiver.stream_to(
                         local_cmd,
                         ["zfs", "receive", "-e", *zfs_overwrite, "-u", dest_parent],
-                        transfer_metrics, progress_print
+                        transfer_metrics, progress.print_cb
                     )
                     asyncio.run(send)
 
@@ -604,7 +597,7 @@ class Config():
                         print("\nOK")
                     else:
                         time.sleep(0.2)
-                        progress_backspace(True)
+                        progress.backspace(True)
 
                 ds_info['send_status'] = 'done'
 
@@ -1151,6 +1144,61 @@ class Receiver():
 
         return update_metrics()
 
+class ProgressBar():
+    def __init__(self, total_bytes):
+        self.total_bytes = total_bytes
+        self.total_bytes_str = self.bytes_str(total_bytes)
+        self._update_env()
+        self.last_content_len = 1
+
+    def backspace(self, flush=False):
+        print(' '*(self.last_content_len+1), end='\r')
+
+    def print_cb(self, kwargs):
+        now = time.time()
+        if now > self.last_update_env + 0.5:
+            self._update_env(now)
+
+        content = self.render(**kwargs)
+        self.backspace()
+        print(content, end='\r', flush=True)
+        self.last_content_len = len(content)
+
+    def render(self, bytes_sent, secs_elapsed):
+        ratio = bytes_sent / self.total_bytes
+        percent = (str(round(ratio * 100, 1)) + "%").rjust(6)
+        bytes_sent_str = self.bytes_str(bytes_sent)
+        parts = [
+            percent+" ",
+            " " + self.time_str(secs_elapsed) + " ",
+            f"{bytes_sent_str} / {self.total_bytes_str}".rjust(14),
+        ]
+
+        max_bar_segs = self.term_width - (sum(map(len, parts)) + 8)
+        if max_bar_segs >= 10:
+            bar_segs = round(float(max(0, min(1, ratio))) * max_bar_segs)
+            bar = '[' + ('#'*bar_segs).ljust(max_bar_segs) + ']'
+        else:
+            bar = '|'
+
+        parts[1:1] = [bar]
+        content = ''.join(parts)[:self.term_width-2]
+        return content
+
+    @staticmethod
+    def bytes_str(sz):
+        return human_readable_bytesize(sz).rstrip(' -').replace(' ','')
+
+    @staticmethod
+    def time_str(secs:int):
+        mins, sec_part = divmod(int(secs), 60)
+        hrs, min_part = divmod(mins, 60)
+        return "{}:{:02}:{:02}".format(hrs, min_part, sec_part)
+
+    def _update_env(self, now=None):
+        self.term_width = os.get_terminal_size().columns
+        self.last_update_env = now or time.time()
+
 def zfs_ancestors_iter(ds):
     while True:
         ds,sep,_ = ds.rpartition('/')
@@ -1460,6 +1508,16 @@ def _dev_stream_test():
     x = r.stream_to(["/root/backup_test/lil-outputter"],
         ["md5sum"], progress_cb=lambda s: print(s["secs_elapsed"]))
     asyncio.run(x)
+
+@subcmd()
+def _progress_test():
+    start = time.time()
+    total = 3_300_000_000
+    progress = ProgressBar(total)
+    for x in range(0, total, 1337970):
+        time.sleep(0.1)
+        arg = {'bytes_sent': x, 'secs_elapsed': int(time.time() - start)}
+        progress.print_cb(arg)
 
 def main():
     try:
