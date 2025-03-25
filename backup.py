@@ -31,7 +31,7 @@ PRIMER_SUFFIX = "-primer"
 # https://pyzfs.readthedocs.io/en/latest/index.html
 #
 import sys, traceback, itertools, os, os.path, time, \
-    argparse, re, subprocess, datetime, json
+    argparse, re, subprocess, signal, datetime, json
 import types, collections, collections.abc, functools
 from collections.abc import Callable
 import asyncio
@@ -65,8 +65,13 @@ if not options['metadata_dir'].startswith('/'):
 
 
 warning_counter = 0
-def warn(msg, prefix="Warning: ", count=1):
+warned_once = set()
+def warn(msg, prefix="Warning: ", count=1, once=False):
     global warning_counter
+    if once:
+        if msg in warned_once:
+            return
+        warned_once.add(msg)
     warning_counter += count
     print(f"{colours.WARN}{prefix}{msg}{colours.RESET}", file=sys.stderr)
 
@@ -136,13 +141,14 @@ class AdvanceableChainIter():
 
     def advance(self):
         if self.stop is not None:
-            return
+            return False
         try:
             self.cur_item = next(self.its)
         except StopIteration as e:
             self.stop = e
         else:
             self.cur_it = iter(self.cur_item)
+        return self.stop is None
 
     def __iter__(self):
         return self
@@ -444,6 +450,10 @@ class Config():
         return self.user_config['scope']['since'] == 'beginning' \
             and self.user_config['scope']['progressive'] == False
 
+    @functools.cache
+    def get_receiver(self, user):
+        return Receiver(**self.user_config['receiver'], user=user)
+
     def calculate_send(self):
         calc_count = 0
         unsnapped_count = 0
@@ -456,16 +466,13 @@ class Config():
                 unsnapped_count += 1
                 continue
 
-            @functools.cache
-            def receiver():
-                return Receiver(**self.user_config['receiver'], user="user")
-
             sz = 0
             for mk_cmd in send_cmd_makers:
                 if mk_cmd.is_primer:
                     # will we actually need to send it?
-                    dest = f"{receiver().dest_dataset}/{ds_info['ds']}@{ds_info['primer_label']}"
-                    if receiver().dataset_exists(dest):
+                    receiver = self.get_receiver("user")
+                    dest = f"{receiver.dest_dataset}/{ds_info['ds']}@{ds_info['primer_label']}"
+                    if receiver.dataset_exists(dest):
                         continue
                 out = run_cmd(*mk_cmd(**ds_info))
                 for l in out.splitlines():
@@ -484,9 +491,10 @@ class Config():
         if unsnapped_count:
             warn(f"{unsnapped_count} snapshots are missing. Calculations for " \
                 "those objects have been skipped.")
-        self._print_calc_result()
+        self._print_calc_result(True)
 
     def do_send(self, *, complete_send_only=True):
+        from_beginning = self.user_config['scope']['since'] == 'beginning' #ie. not incremental
         total_bytes = 0
         initial_sent_bytes = 0
         datasets_ready = []
@@ -520,37 +528,74 @@ class Config():
             print(transfer_metrics['bytes_sent'], '/', total_bytes,
                 end='', flush=True)
 
-        # desired free space kinda arbitrary; I just picked what felt right
-        # idk what kind of storage overhead actually exists, if any
-        if (int(total_bytes * 1.02) + 2**17) > receiver.get_space_avail():
-            raise ReceiverError("Receiver does not have enough free space")
+        # don't exit haphazardly if the program is interrupted (set signal handlers)
+        signame = None
+        def get_interrupted(sig, _):
+            nonlocal signame
+            signame = {2: "SIGINT", 15: "SIGTERM"}.get(sig, "(unknown signal)")
+            print(f"\ngot {signame}. exiting soon", file=sys.stderr)
+            while datasets_iter.advance():
+                pass
+        other_sig_handlers = {
+            signal.SIGINT: signal.signal(signal.SIGINT, get_interrupted),
+            signal.SIGTERM: signal.signal(signal.SIGTERM, get_interrupted),
+        }
 
+        # main send loop
         for ds_info in datasets_iter:
-            for mk_local_cmd in local_send_cmd_makers:
-                local_cmd = mk_local_cmd(**ds_info)
+            dest_ds = receiver.dest_dataset +'/'+ ds_info['ds']
+            dest_parent = dest_ds.rsplit('/', maxsplit=1)[0]
+            try:
+                dest_ds_exists = receiver.dataset_exists(dest_ds)
+                if not dest_ds_exists:
+                    if from_beginning:
+                        # create parent container if it doesn't exist
+                        receiver.run_cmd(*("zfs create -p -u".split()), dest_parent)
+                    else:
+                        raise ReceiverError("Wanting to do an incremental send, " \
+                                            "but destination dataset doesn't exist.")
 
-                if mk_local_cmd.is_primer:
-                    snap_segment = '@' + ds_info['primer_label']
-                else:
-                    snap_segment = self.user_config['scope']['target-snapshot']
-                dest_snap = receiver.dest_dataset +'/'+ ds_info['ds'] + snap_segment
-                dest_parent, dest_snap_shortname = dest_snap.rsplit('/', maxsplit=1)
+                if ds_info['send_status'] == 'ready':
+                    # This is the first attempt sending (otherwise send_status would be
+                    # 'interrupted'). Check if destination can later be rolled back to
+                    # the current state in case of interruption.
+                    if from_beginning:
+                        if not dest_ds_exists:
+                            ds_info['rollback-option'] = 'beginning'
+                    # setting rollback-option to a snapshot (incremental sends) is
+                    # not implemented
+                elif options['allow-rollback']:
+                    # follow-up attempt; try rollback
+                    if ds_info['rollback-option'] == 'beginning':
+                        if dest_ds_exists:
+                            receiver.run_cmd("zfs", "destroy", "-r", dest_ds)
+                            receiver.run_cmd(*f"zfs wait -t deleteq {dest_parent}".split())
+                    elif not from_beginning:
+                        warn("Rollback of incremental send is not implemented. " \
+                            "If a rollback proves necessary, it will have to be " \
+                            "done manually.", once=True)
 
-                try:
+                for mk_local_cmd in local_send_cmd_makers:
+                    local_cmd = mk_local_cmd(**ds_info)
+
+                    if mk_local_cmd.is_primer:
+                        snap_segment = '@' + ds_info['primer_label']
+                    else:
+                        snap_segment = self.user_config['scope']['target-snapshot']
+                    dest_snap = receiver.dest_dataset +'/'+ ds_info['ds'] + snap_segment
+
                     if receiver.dataset_exists(dest_snap):
                         if mk_local_cmd.is_primer:
                             continue
                         else:
-                            raise ReceiverError("Destination snapshot already exists")
-
-                    # create parent container if it doesn't exist
-                    receiver.run_cmd(*("zfs create -p -u".split()), dest_parent)
+                            raise ReceiverError("Target snapshot already exists at destination")
 
                     # send! HOORAY!
                     print("sending", local_cmd[-1])
+                    zfs_overwrite = {False:[], True:["-F"]}[options['zfs-overwrite']]
                     send = receiver.stream_to(
                         local_cmd,
-                        ["zfs", "receive", "-e", "-u", dest_parent],
+                        ["zfs", "receive", "-e", *zfs_overwrite, "-u", dest_parent],
                         transfer_metrics, progress_print
                     )
                     asyncio.run(send)
@@ -561,22 +606,28 @@ class Config():
                         time.sleep(0.2)
                         progress_backspace(True)
 
-                except Exception as e:
-                    print(f"{colours.ERR}{e}{colours.RESET}", file=sys.stderr)
-                    exceptions += [f"error while attempting to send {ds_info['ds']}", e]
-                    ds_info['send_status'] = 'interrupted'
-                    #
-                    datasets_iter.advance()
-                    break
+                ds_info['send_status'] = 'done'
 
-            ds_info['send_status'] = 'done'
+            except Exception as e:
+                print(f"{colours.ERR}{e}{colours.RESET}", file=sys.stderr)
+                exceptions += [f"error while attempting to send {ds_info['ds']}", e]
+                ds_info['send_status'] = 'interrupted'
+                #
+                datasets_iter.advance()
 
+        # we're done with the heavy stuff; revert signal handlers
+        for x in other_sig_handlers.items():
+            signal.signal(*x)
+
+        # report on how things went
         sent = transfer_metrics['bytes_sent'] - initial_sent_bytes
         if sent:
             print("sent " + human_readable_bytesize(sent).strip(' -'))
         if exceptions:
             print(f"{colours.ERR}send failed{colours.RESET}", file=sys.stderr)
             raise MyError(*exceptions, error_code='send')
+        elif signame:
+            warn("send exited early!")
         else:
             print("send completed successfully!")
 
@@ -731,6 +782,7 @@ class Config():
                 "size": None,
                 "send_status": "notready",
                 "primer_label": None,
+                "rollback-option": None,
             }
         else:
             dataset_info = {}
@@ -915,7 +967,7 @@ class Config():
         maker_specs = list(enumerate(command_templs))[int(not self.uses_primer):]
         return [make(i,templ) for i,templ in maker_specs]
 
-    def _print_calc_result(self):
+    def _print_calc_result(self, query_receiver=False):
         total = 0
         skipped = 0
         print("\nsend size:")
@@ -926,8 +978,22 @@ class Config():
                 total += sz
             else:
                 skipped += 1
+
         if not skipped:
             print(human_readable_bytesize(total),"(total)")
+
+            if query_receiver:
+                avail = self.get_receiver("user").get_space_avail()
+                readable_avail = human_readable_bytesize(avail).strip(' -')
+                print("Available space on receiver:", readable_avail)
+                if (total / avail) > 0.75:
+                    ratio = str(round(total / avail * 100)) + "%"
+                    warn(f"Send size is {ratio} of available space on receiver. " \
+                        "Because of possible differences in pool/dataset " \
+                        "configuration (block size, compression type, etc.), " \
+                        "this program is unable to predict whether sent data " \
+                        "will fit in the available space. Until technology " \
+                        "improves, that determination is left up to the user. ")
         else:
             warn("There are uncalculated datasets. Results are incomplete.")
 
@@ -1045,6 +1111,10 @@ class Receiver():
                 progress_cb(metrics)
 
         read_limit = 1024 ** 2
+        full_recv_cmd = ["/usr/bin/qvm-run", "--no-auto", "--no-shell", \
+            f"--user={self.user}", *self.OUTPUT_ARGS, self.qube, "--", *recv_cmd,]
+        track_commandline([*local_cmd, '|', *full_recv_cmd])
+        #
         local_proc, recv_proc = await asyncio.gather(
             asyncio.create_subprocess_exec(
                 *local_cmd,
@@ -1052,8 +1122,7 @@ class Receiver():
                 limit=(2 * read_limit),
             ),
             asyncio.create_subprocess_exec(
-                "/usr/bin/qvm-run", "--no-auto", "--no-shell", f"--user={self.user}",
-                *self.OUTPUT_ARGS, self.qube, "--", *recv_cmd,
+                *full_recv_cmd,
                 stdin=asyncio.subprocess.PIPE,
             )
         )
@@ -1076,6 +1145,9 @@ class Receiver():
             asyncio.create_task(recv_proc.wait()),
             metrics_idle_task)
         )
+        for role,proc in [("local",local_proc), ("recv",recv_proc)]:
+            if proc.returncode != 0:
+                raise ReceiverError(f"{role} proc exited: {proc.returncode}")
 
         return update_metrics()
 
@@ -1213,11 +1285,21 @@ def get_cli_options():
     p.add_argument('-v', dest="verbose", action="store_true")
     if 'config_name' in cmd['tags']:
         p.add_argument("config_name")
+    if 'send-opts' in cmd['tags']:
+        p.add_argument('-f', dest="allow-rollback", action="store_true")
+        p.add_argument('-F', dest="zfs-overwrite", action="store_true")
     if 'file1' in cmd['tags']:
         p.add_argument("file1")
-    opts = p.parse_args(sys.argv[2:])
 
-    return cmd, dict(vars(opts))
+    opts = dict(vars(
+        p.parse_args(sys.argv[2:])
+    ))
+
+    # extra validation
+    if 'send-opts' in cmd['tags'] and opts['zfs-overwrite'] and not opts['allow-rollback']:
+        raise argparse.ArgumentError("-F requires -f to also be specified.")
+
+    return cmd, opts
 
 
 
@@ -1284,7 +1366,7 @@ def _calc():
     finally:
         config.save()
 
-@subcmd('backupcmd', 'config_name')
+@subcmd('backupcmd', 'config_name', 'send-opts')
 def _send():
     """\
     Copies the included set to the receiver qube. If it succeeds, the backup
