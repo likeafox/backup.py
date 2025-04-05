@@ -7,7 +7,8 @@ options = {
     # verbose is here so it can have a value at program-initialization time;
     # gets overwritten by cli opts early on
     "verbose": True,
-    "always-prime": True,
+    # enables printing debug messages
+    "debug": True,
 }
 
 VERSION = 0
@@ -22,7 +23,6 @@ ERROR_CODES = {
 }
 CONFIG_FILE_VERSION = "1"
 CONFIG_FILE_EXT = "backupcfg"
-PRIMER_SUFFIX = "-primer"
 
 # libraries reference:
 # qubesadmin:
@@ -55,6 +55,9 @@ colours = types.SimpleNamespace(
     BOLD = '\x1b[1m',
     RESET = '\x1b[0m'
 )
+
+def compose(*funcs):
+    return lambda x: functools.reduce(lambda v,f:f(v), funcs, x)
 
 apparent_command_name = os.path.basename(sys.argv[0])
 real_command_dir, real_command_name = \
@@ -189,8 +192,11 @@ class MyError(Exception):
 class ConfigError(MyError):
     error_code = ERROR_CODES['input']
 
-    def __init__(self):
+    def __init__(self, verrs=None):
         self.verrs = []
+        if verrs is not None:
+            for e in verrs:
+                self += e
 
     def __iadd__(self, other):
         assert hasattr(other,"__len__") and len(other) == 2
@@ -306,17 +312,10 @@ class ConfigHeader(collections.abc.Mapping):
         return dict(items)
 
 class Config():
-    PERSISTENT = ('user_config', 'raw_user_config', 'objects')
+    PERSISTENT = ('user_config', 'raw_user_config', 'objects', 'targets')
 
     @classmethod
-    def import_(cls, filename):
-        try:
-            with open(filename) as f:
-                raw_user_config = f.read()
-        except FileNotFoundError as e:
-            err_str = f"{e.strerror}: {e.filename}"
-            raise MyError(err_str, error_code='notfound')
-
+    def import_(cls, raw_user_config):
         user_config = cls._parse_user_config(raw_user_config)
         cls._check_objs_exist(user_config)
         objects = [cls._mk_objects_pt2(o) for o in cls._mk_objects_pt1_gen(user_config)]
@@ -327,13 +326,24 @@ class Config():
         o.header["importdate"] = \
             datetime.datetime.now().isoformat(sep=' ',timespec='minutes')
 
+        o._resolve_targets(o.get_designation_graph())
         o._serialize()
-        o.get_graph()
-        for ds_info in o.included_datasets:
-            o._check_on_snapshot_state(ds_info)
+        for target in o.targets:
+            o._check_on_snapshot_state(target)
         print(f"Config validation {colours.OK}PASSED{colours.RESET}")
         time.sleep(0.9)
         return o
+
+    @classmethod
+    def import_file(cls, filename):
+        try:
+            with open(filename) as f:
+                raw_user_config = f.read()
+        except FileNotFoundError as e:
+            err_str = f"{e.strerror}: {e.filename}"
+            raise MyError(err_str, error_code='notfound')
+
+        return cls.import_(raw_user_config)
 
     def save(self):
         with open(self.filepath(self.name), 'wb') as f:
@@ -376,79 +386,63 @@ class Config():
         r.sort()
         return r
 
-    @functools.cached_property
-    def included_datasets(self):
-        x = (o['datasets'] for o in self.objects if o['role'] == 'include')
-        return list(chain_iter(x))
-
-    def get_graph(self):
+    def get_designation_graph(self):
         try:
-            r = self._graph
+            r = self._des_graph
         except:
-            r = self._graph = self._make_graph(self.objects)
+            r = self._des_graph = self._make_designation_graph(self.objects)
         return r
+
+    @functools.cached_property
+    def objects_by_name(self):
+        return {o['name'] : o for o in self.objects}
 
     def print_import_analysis(self):
         print("Analysis:")
-        self._print_coverage_analysis(self.get_graph())
+        self._print_coverage_analysis(self.get_designation_graph())
         print()
         self._print_snapshots_analysis()
 
     def do_snapshots(self):
-        def ds_gen():
-            for o in self.objects:
-                if o['role'] == 'include':
-                    for ds_info in o["datasets"]:
-                        yield (ds_info['ds'], ds_info, o)
-        #
         deferred = 0
-        target = self.user_config['scope']['target-snapshot']
-        snaps_allowed = self.user_config['scope']['allow-snapshot-creation']
-        #
-        for ds,ds_info,o in ds_gen():
-            if ds_info['snap'] in ('unknown','blocked'):
-                self._check_on_snapshot_state(ds_info)
+        creation_allowed = self.user_config['allowed-behaviours']['snapshot-creation']
+        for target in self.targets:
+            if target['snap_creation'] in ('unknown','blocked'):
+                self._check_on_snapshot_state(target)
 
             # can we snap?
-            if not snaps_allowed:
+            if not creation_allowed:
                 continue
-            if ds_info['snap'] != 'would':
+            if target['snap_creation'] != 'would':
                 continue
-            if o['type'] == 'qubes':
-                args = f"qvm-check -q --running {o['member_name']}".split()
+            ds = target['snapshot'][0]
+            obj = self.objects_by_name.get(target['obj_name'], None)
+            if obj and obj['type'] == 'qubes':
+                args = f"qvm-check -q --running {obj['member_name']}".split()
+                track_commandline(args)
                 exitcode = subprocess.run(args).returncode
                 if exitcode == 0:
-                    warn(f"Qube {o['member_name']} is running. Deferring snapshot creation.")
+                    msg = f"Qube {obj['member_name']} is running. Deferring snapshot creation."
+                    warn(msg, once=True)
                     deferred += 1
                     continue
-            elif o['type'] == 'datasets':
-                zvols = contained_zvols_attached_to_any_domain(ds)
-                if zvols:
-                    for zvol in zvols:
-                        warn(f"Volume {zvol} is attached to a qube. Deferring snapshot creation.")
+            else:
+                is_attached = ds in get_zvols_attached_to_any_qube()
+                if is_attached:
+                    warn(f"Volume {ds} is attached to a qube. Deferring snapshot creation.")
                     deferred += 1
                     continue
 
             # yes, snap
-            snap_name = ds+target
-            primer_name = snap_name+PRIMER_SUFFIX
-            if self.uses_primer or options['always-prime']:
-                if not libzfs_core.lzc_exists(primer_name.encode('ascii')):
-                    run_cmd("zfs","snapshot",primer_name)
-                ds_info['primer_label'] = target.removeprefix('@') + PRIMER_SUFFIX
-            run_cmd("zfs","snapshot","-r",snap_name)
-            ds_info['snap'] = 'done'
+            snap_name = '@'.join(target['snapshot'])
+            run_cmd("zfs","snapshot",snap_name)
+            target['snap_creation'] = 'done'
             print("snapshotted "+ds)
 
         self._print_snapshots_analysis()
         if deferred:
             warn(f"{deferred} deferred snapshots. Re-run the command once " \
                 "the preconditions are satisfied.", prefix='', count=0)
-
-    @property
-    def uses_primer(self):
-        return self.user_config['scope']['since'] == 'beginning' \
-            and self.user_config['scope']['progressive'] == False
 
     @functools.cache
     def get_receiver(self, user):
@@ -457,33 +451,24 @@ class Config():
     def calculate_send(self):
         calc_count = 0
         unsnapped_count = 0
-        send_cmd_makers = self._make_send_cmd_makers('calc')
 
-        for ds_info in self.included_datasets:
-            if type(ds_info['size']) is int:
+        for target in self.targets:
+            if type(target['send_size']) is int:
                 continue
-            if ds_info['snap'] not in ('done','yes'):
+            if target['snap_creation'] not in ('done','yes','ignore'):
                 unsnapped_count += 1
                 continue
 
-            sz = 0
-            for mk_cmd in send_cmd_makers:
-                if mk_cmd.is_primer:
-                    # will we actually need to send it?
-                    receiver = self.get_receiver("user")
-                    dest = f"{receiver.dest_dataset}/{ds_info['ds']}@{ds_info['primer_label']}"
-                    if receiver.dataset_exists(dest):
-                        continue
-                out = run_cmd(*mk_cmd(**ds_info))
-                for l in out.splitlines():
-                    fields = l.split()
-                    if fields[:1] == ["size"]:
-                        sz += int(fields[1])
-                        break
-                else:
-                    raise Exception("size not found")
-            ds_info['size'] = sz
-            ds_info['send_status'] = 'ready'
+            out = run_cmd(*self._make_send_cmd(target,'calc'))
+            for l in out.splitlines():
+                fields = l.split()
+                if fields[:1] == ["size"]:
+                    sz = int(fields[1])
+                    break
+            else:
+                raise Exception("size not found")
+            target['send_size'] = sz
+            target['send_status'] = 'ready'
             calc_count += 1
 
         if calc_count:
@@ -493,28 +478,20 @@ class Config():
                 "those objects have been skipped.")
         self._print_calc_result(True)
 
-    def do_send(self, *, complete_send_only=True):
-        from_beginning = self.user_config['scope']['since'] == 'beginning' #ie. not incremental
+    def do_send(self, *, phases=('interrupted','depth'), complete_send_only=True):
         total_bytes = 0
         initial_sent_bytes = 0
-        datasets_ready = []
-        datasets_interrupted = []
-        for ds_info in self.included_datasets:
-            s = ds_info['send_status']
-            if ds_info['send_status'] != 'notready':
-                total_bytes += ds_info['size']
-                match ds_info['send_status']:
-                    case 'ready':
-                        datasets_ready.append(ds_info)
-                    case 'interrupted':
-                        datasets_interrupted.append(ds_info)
-                    case 'done':
-                        initial_sent_bytes += ds_info['size']
+        for t in self.targets:
+            if t['send_status'] != 'notready':
+                total_bytes += t['send_size']
+                if t['send_status'] == 'done':
+                    initial_sent_bytes += t['send_size']
             elif complete_send_only:
                 raise Exception("can't send: previous phases are incomplete")
 
-        datasets_iter = AdvanceableChainIter(datasets_interrupted, datasets_ready)
-        local_send_cmd_makers = self._make_send_cmd_makers('send')
+        targets_graph = TargetDependencyGraph(self.targets)
+        targets_iter = \
+            AdvanceableChainIter(*(targets_graph.sendables_iter(ph) for ph in phases))
         exceptions = []
         receiver = Receiver(**self.user_config['receiver'])
         transfer_metrics = receiver.new_transfer_metrics()
@@ -527,7 +504,7 @@ class Config():
             nonlocal signame
             signame = {2: "SIGINT", 15: "SIGTERM"}.get(sig, "(unknown signal)")
             print(f"\ngot {signame}. exiting soon", file=sys.stderr)
-            while datasets_iter.advance():
+            while targets_iter.advance():
                 pass
         other_sig_handlers = {
             signal.SIGINT: signal.signal(signal.SIGINT, get_interrupted),
@@ -535,78 +512,86 @@ class Config():
         }
 
         # main send loop
-        for ds_info in datasets_iter:
-            dest_ds = receiver.dest_dataset +'/'+ ds_info['ds']
-            dest_parent = dest_ds.rsplit('/', maxsplit=1)[0]
+        for t in targets_iter:
+            ds, snaplabel = t['snapshot']
+            local_snap = f"{ds}@{snaplabel}"
+            dest_ds = f"{receiver.dest_dataset}/{ds}"
+            dest_snap = f"{dest_ds}@{snaplabel}"
+            dest_parent = dest_snap.rsplit('/', maxsplit=1)[0]
+            incr_src = t['incremental_source']
             try:
+                if receiver.dataset_exists(dest_snap):
+                    if self.user_config['allowed-behaviours']['patching']:
+                        total_bytes -= t['send_size']
+                        t['send_size'] = 0
+                        t['send_status'] = 'done'
+                        progress = ProgressBar(total_bytes)
+                        print(local_snap,"already exists on receiver. Marking as complete.")
+                        continue
+                    else:
+                        raise ReceiverError(f"Target {local_snap} already exists at destination")
+
                 dest_ds_exists = receiver.dataset_exists(dest_ds)
                 if not dest_ds_exists:
-                    if from_beginning:
-                        # create parent container if it doesn't exist
-                        receiver.run_cmd(*("zfs create -p -u".split()), dest_parent)
-                    else:
-                        raise ReceiverError("Wanting to do an incremental send, " \
-                                            "but destination dataset doesn't exist.")
+                    if incr_src and incr_src[0] == ds:
+                        raise ReceiverError("incremental source doesn't exist on receiving end.")
+                    # create parent container if it doesn't exist
+                    receiver.run_cmd(*("zfs create -p -u".split()), dest_parent)
+                    if t['send_status'] == 'ready':
+                        # This is the first attempt sending (otherwise send_status would be
+                        # 'interrupted'), and dest_ds doesn't exist so this rollback option
+                        # can be set
+                        t['rollback_option'] = 'delete-ds'
 
-                if ds_info['send_status'] == 'ready':
-                    # This is the first attempt sending (otherwise send_status would be
-                    # 'interrupted'). Check if destination can later be rolled back to
-                    # the current state in case of interruption.
-                    if from_beginning:
-                        if not dest_ds_exists:
-                            ds_info['rollback-option'] = 'beginning'
-                    # setting rollback-option to a snapshot (incremental sends) is
-                    # not implemented
-                elif options['allow-rollback']:
+                if t['send_status'] == 'interrupted' and options['allow-rollback']:
                     # follow-up attempt; try rollback
-                    if ds_info['rollback-option'] == 'beginning':
+                    if t['rollback_option'] == 'delete-ds':
                         if dest_ds_exists:
                             receiver.run_cmd("zfs", "destroy", "-r", dest_ds)
                             receiver.run_cmd(*f"zfs wait -t deleteq {dest_parent}".split())
-                    elif not from_beginning:
+                    elif incr_src and incr_src[0] == ds:
                         warn("Rollback of incremental send is not implemented. " \
                             "If a rollback proves necessary, it will have to be " \
                             "done manually.", once=True)
 
-                for mk_local_cmd in local_send_cmd_makers:
-                    local_cmd = mk_local_cmd(**ds_info)
+                local_cmd = self._make_send_cmd(t, 'send')
+                recv_cmd = ["zfs", "receive"]
+                if options['zfs-overwrite']:
+                    recv_cmd += ["-F"]
+                if incr_src and incr_src[0] != ds:
+                    recv_cmd += [
+                        "-o",
+                        f"origin={receiver.dest_dataset}/{incr_src[0]}@{incr_src[1]}",
+                    ]
+                recv_cmd += [dest_ds]
 
-                    if mk_local_cmd.is_primer:
-                        snap_segment = '@' + ds_info['primer_label']
-                    else:
-                        snap_segment = self.user_config['scope']['target-snapshot']
-                    dest_snap = receiver.dest_dataset +'/'+ ds_info['ds'] + snap_segment
+                # send! HOORAY!
+                print("sending", local_snap)
+                send = receiver.stream_to(
+                    local_cmd, recv_cmd, transfer_metrics, progress.print_cb
+                )
+                asyncio.run(send)
 
-                    if receiver.dataset_exists(dest_snap):
-                        if mk_local_cmd.is_primer:
-                            continue
-                        else:
-                            raise ReceiverError("Target snapshot already exists at destination")
-
-                    # send! HOORAY!
-                    print("sending", local_cmd[-1])
-                    zfs_overwrite = {False:[], True:["-F"]}[options['zfs-overwrite']]
-                    send = receiver.stream_to(
-                        local_cmd,
-                        ["zfs", "receive", "-e", *zfs_overwrite, "-u", dest_parent],
-                        transfer_metrics, progress.print_cb
-                    )
-                    asyncio.run(send)
-
+                time.sleep(0.2)
+                if options['verbose']:
+                    print()
+                if receiver.dataset_exists(dest_snap):
+                    # Done!
                     if options['verbose']:
                         print("\nOK")
                     else:
-                        time.sleep(0.2)
                         progress.backspace(True)
-
-                ds_info['send_status'] = 'done'
+                    t['send_status'] = 'done'
+                else:
+                    # :(
+                    raise ReceiverError("Unable to confirm existence of newly sent snapshot")
 
             except Exception as e:
                 print(f"{colours.ERR}{e}{colours.RESET}", file=sys.stderr)
-                exceptions += [f"error while attempting to send {ds_info['ds']}", e]
-                ds_info['send_status'] = 'interrupted'
+                exceptions += [f"error while attempting to send {local_snap}", e]
+                t['send_status'] = 'interrupted'
                 #
-                datasets_iter.advance()
+                targets_iter.advance()
 
         # we're done with the heavy stuff; revert signal handlers
         for x in other_sig_handlers.items():
@@ -622,7 +607,17 @@ class Config():
         elif signame:
             warn("send exited early!")
         else:
-            print("send completed successfully!")
+            remain = len(targets_graph)
+            if remain:
+                print(f"Stopped send with {remain} unsent targets remaining.")
+            else:
+                print("send completed successfully!")
+
+    @staticmethod
+    def _designating_groups(user_config):
+        for cat in ("include","forgo","void"):
+            for gn in user_config[cat+"-groups"]:
+                yield cat,gn
 
     @staticmethod
     def _parse_user_config(raw_config):
@@ -677,19 +672,22 @@ class Config():
         test("name", str, cat="word")
         test("scope.since", str, cat="snap")
         test("scope.progressive", bool)
-        test("scope.allow-snapshot-creation", bool)
+        test("scope.honour-origins", bool)
+        test("allowed-behaviours.snapshot-creation", bool)
+        test("allowed-behaviours.patching", bool)
         test("receiver.qube", str, cat="word")
         test("receiver.dataset", str, cat="dataset")
-        if test("include-groups", list) and test("exclude-groups", list):
+
+        if all(test(l+"-groups", list) for l in ("include","forgo","void")):
+            dgs = list(Config._designating_groups(config))
+            groups_set = set(gn for cat,gn in dgs)
             group_types = ("qubes","datasets")
-            groups = list(itertools.chain(config["include-groups"],config["exclude-groups"]))
-            groups_set = set(groups)
             for g in groups_set:
                 if test(g, cat="group"):
                     test(g+".type", validator=lambda x: x in group_types)
                     test(g+".members", list)
-            if len(groups) != len(groups_set):
-                validation_errors += "groups", "Includes/excludes contain redundant group references"
+            if len(dgs) != len(groups_set):
+                validation_errors += "groups", "Includes/forgos/voids contain redundant group references"
 
         if validation_errors:
             raise validation_errors
@@ -701,9 +699,9 @@ class Config():
         """check if all referenced qubes and datasets exist
         (except for receiver.dataset and all things in unused groups)"""
         def all_of(t):
-            for g in itertools.chain(user_config["include-groups"],user_config["exclude-groups"]):
-                if user_config[g]["type"] == t:
-                    yield from user_config[g]["members"]
+            for c,gn in Config._designating_groups(user_config):
+                if user_config[gn]["type"] == t:
+                    yield from user_config[gn]["members"]
         errs = ConfigError()
         if user_config['receiver']['qube'] not in qube_list.get():
             errs += ('receiver.qube', "Qube does not exist")
@@ -718,212 +716,331 @@ class Config():
 
     @staticmethod
     def _mk_objects_pt1_gen(user_config):
-        """atomize include/exclude targets into standalone objects,
-        and resolve all datasets"""
-        for r in ("include","exclude"):
-            for gn in user_config[f"{r}-groups"]:
-                for m in user_config[gn]["members"]:
-                    yield {
-                        "role": r,
-                        "groupname": gn,
-                        "member_name": m,
-                        "type": user_config[gn]["type"],
-                        "ignore_datasets": [],
-                    }
+        """atomize include/forgo/void designators into standalone objects,
+        and resolve designated datasets"""
+        for cat,gn in Config._designating_groups(user_config):
+            for m in user_config[gn]["members"]:
+                yield {
+                    "role_designation": cat,
+                    "groupname": gn,
+                    "member_name": m,
+                    "type": user_config[gn]["type"],
+                }
 
     @staticmethod
     def _mk_objects_pt2(o):
         m = o["member_name"]
-        if o['type'] == "qubes":
-            o["name"] = "qube:" + m
+
+        if o['type'] == 'qubes':
+            o['name'] = "qube:" + m
             vols = qubesd_query("admin.vm.volume.List",m)
-            vol_parents = set()
-            vol_pools = set()
-            infos = []
+            vol_parents = {}
+            infos_to_incl = []
+            vids = set()
             for vol in vols:
                 if vol == "kernel":
                     continue
                 vol_info = qubesd_query("admin.vm.volume.Info",m,vol)
-                if vol_info["ephemeral"] != "False":
+                if vol_info['ephemeral'] != "False":
                     raise Exception(["idk what ephemeral does",m,vol,vol_info])
-                if vol_info["pool"] not in qubes_pools_info.get():
+                if vol_info['pool'] not in qubes_pools_info.get():
                     warn(f"not all of qube {m}'s volumes are in "
-                        "an applicable pool. Some volumes won't be backed up")
+                        "an applicable pool. Some volumes won't be included")
                     continue
-                if vol_info["save_on_stop"] != "True":
-                    o['ignore_datasets'].append(vol_info["vid"])
-                    continue
-                vol_parent, vol_name = vol_info["vid"].rsplit('/',maxsplit=1)
+                vids.add(vol_info['vid'])
+                vol_parent, vol_name = vol_info['vid'].rsplit('/',maxsplit=1)
                 assert vol == vol_name
-                vol_parents.add(vol_parent)
-                vol_pools.add(vol_info["pool"])
-                infos.append(vol_info)
-            if 1 == len(vol_parents) == len(vol_pools):
-                #all volumes share the same parent, use the parent for backup
-                dataset_names = [next(iter(vol_parents))]
-            else:
-                dataset_names = [i["vid"] for i in infos]
-        elif o['type'] == "datasets":
-            o["name"] = "dataset:" + m
-            dataset_names = [m]
+                if vol_info['save_on_stop'] != "True":
+                    vol_parents.setdefault(vol_parent, False)
+                    continue
+                vol_parents[vol_parent] = True
+                infos_to_incl.append(vol_info)
+
+            o['datasets'] = [ds for ds,incl in vol_parents.items() if incl] + \
+                            [i['vid'] for i in infos_to_incl]
+            o['ignore_datasets'] = [ds for ds,incl in vol_parents.items() if incl == False]
+
+            # warn for missed non-qube datasets
+            prefixes = [k+'/' for k in vol_parents]
+            for ds in dataset_list.get():
+                for pref in prefixes:
+                    if ds.startswith(pref) and ds not in vids:
+                        warn(f"{ds} does not belong to qube {m}, and won't be included.")
+                        break
+
+        elif o['type'] == 'datasets':
+            o['name'] = "dataset:" + m
+            args = "zfs list -H -t filesystem,volume -o name -r".split() + [m]
+            o['datasets'] = run_cmd(*args).splitlines()
+            o['ignore_datasets'] = []
         else:
             assert False
-        if o['role'] == "include":
-            dataset_info = {
-                # "ds": <dataset name>,
-                "snap": "unknown",
-                "size": None,
-                "send_status": "notready",
-                "primer_label": None,
-                "rollback-option": None,
-            }
-        else:
-            dataset_info = {}
-        o['datasets'] = [(dataset_info | {"ds":n}) for n in dataset_names]
         return o
 
     @staticmethod
-    def _make_graph(objects):
-        """make graph, checking for duplicate and/or nested qubes and datasets"""
+    def _make_designation_graph(objects):
+        """make graph, checking for duplicate and/or nested (in zfs dataset hierarchy) designations"""
         @(lambda x: dict(x()))
         def graph():
             qubes_containers = '|'.join(pi["container"] for pi in qubes_pools_info.get().values())
             disp_pat = re.compile('(' + qubes_containers + r')/disp\d{1,4}')
             for ds in dataset_list.get():
-                ignore = bool(disp_pat.fullmatch(ds)) or '/.' in ds
-                yield ds,{"own_obj": None, "descendant_objects": [], "ignore": ignore}
+                k = tuple(ds.split('/'))
+                node = {
+                    "k": k,
+                    "ds": ds,
+                    "ancestors": [k[:n] for n in range(len(k)-1, 0, -1)],
+                    "des_objs": [], #objects designating this node
+                    "descendant_des": [], #descendant designations
+                    "ignore": (bool(disp_pat.fullmatch(ds)) or '/.' in ds),
+                }
+                yield k,node
+
+        def designations_of(obj):
+            dataset_ks = set(tuple(ds.split('/')) for ds in o['datasets'])
+            for k in dataset_ks.copy():
+                if dataset_ks & set(graph[k]['ancestors']):
+                    dataset_ks.remove(k)
+            return dataset_ks
         #
         errs = ConfigError()
+        def collision_err(anc_ds, anc_o, desc_ds, desc_o):
+            if anc_ds == desc_ds:
+                if anc_o['name'] == desc_o['name']:
+                    msg = "Duplicate objects"
+                else:
+                    msg = f"Designation on {'/'.join(anc_ds)} conflicts with {desc_o['name']}"
+            else:
+                msg = f"{desc_o['name']} is nested in {'/'.join(anc_ds)}"
+            errs += anc_o['name'], msg
+        #
         for o in objects:
-            for i,ds_info in enumerate(o['datasets']):
-                ds = ds_info['ds']
-                node = graph[ds]
-                if node["own_obj"] is not None:
-                    msg = f"Duplicate reference conflicts with {node['own_obj'][0]['name']}"
-                    errs += o['name'], msg
-                # parents = [(pds,graph[pds]) for pds in parents_iter(ds)]
-                ancestor_objs = filter(bool, (graph[pds]["own_obj"] for pds in zfs_ancestors_iter(ds)))
-                ancestor_collisions = ((a,(o,i)) for a in ancestor_objs)
-                descendant_collisions = (((o,i),d) for d in node["descendant_objects"])
-                for a,d in itertools.chain(ancestor_collisions, descendant_collisions):
-                    msg = f"{d[0]['name']} is nested in {a[0]['datasets'][a[1]]['ds']}"
-                    errs += a[0]['name'], msg
+            for des in designations_of(o):
+                node = graph[des]
+                for other in node['des_objs']:
+                    # direct collision
+                    collision_err(des, o, des, other)
+                node['des_objs'].append(o)
 
-                node["own_obj"] = (o,i)
-                for pds in zfs_ancestors_iter(ds):
-                    graph[pds]["descendant_objects"].append((o,i))
+                for desc in node['descendant_des']:
+                    for other in graph[desc]['des_objs']:
+                        if other['role_designation'] in ('include','forgo'):
+                            # collision by occluding other
+                            collision_err(des, o, desc, other)
 
-            for ids in o["ignore_datasets"]:
+                for anc in node['ancestors']:
+                    anc_node = graph[anc]
+                    anc_node['descendant_des'].append(des)
+                    for other in anc_node['des_objs']:
+                        if o['role_designation'] in ('include','forgo'):
+                            # collision by nesting in other
+                            collision_err(anc, other, des, o)
+
+            for ids_str in o["ignore_datasets"]:
+                ids = tuple(ids_str.split('/'))
                 if ids in graph:
                     graph[ids]["ignore"] = True
         if errs:
             raise errs
+
+        for node in graph.values():
+            relevant_nodes = [node] + [graph[a] for a in node['ancestors']]
+            for other_n in relevant_nodes:
+                if other_n['des_objs']:
+                    [other_obj] = other_n['des_objs']
+                    node['ancestor_des_exists'] = True
+                    if node['ds'] in other_obj['datasets']:
+                        node['role_obj'] = other_obj
+                        node['role'] = other_obj['role_designation']
+                        break
+            else:
+                node['ancestor_des_exists'] = False
+                node['role_obj'] = None
+                node['role'] = 'forgo'
         return graph
 
+    def _resolve_targets(self, des_graph):
+        assert not hasattr(self, "targets")
+        progressive = self.user_config['scope']['progressive']
+        target_snaplabel = self.user_config['scope']['target-snapshot'].removeprefix('@')
+        since_snaplabel = (lambda x: None if x == 'beginning' else x.removeprefix('@')) \
+                          (self.user_config['scope']['since'])
+        snap_txg_map = {snap : txg for txg,snap in snap_txg_order.get()}
+        max_snap_txg = snap_txg_order.get()[-1][0]
+        snap_txg_order_by_ds = collections.defaultdict(list)
+        prev_txg = -1
+        for txg,(ds,label) in snap_txg_order.get():
+            assert txg >= prev_txg
+            snap_txg_order_by_ds[ds].append((txg,label))
+            prev_txg = txg
+
+        prototargets = {} # dict of (target : incr_src)
+        targets_to_add = {
+            (n['ds'], target_snaplabel) for n in des_graph.values() \
+                if n['role'] == 'include'
+        }
+        snapshottable_targets = targets_to_add.copy()
+        while targets_to_add:
+            ds,snaplabel = targets_to_add.pop()
+            all_snaps = []
+            for txg,label2 in snap_txg_order_by_ds[ds]:
+                all_snaps.append(label2)
+                if label2 == snaplabel:
+                    break
+
+            incr_src = None # as in "incremental source" from zfs-send man page
+            if since_snaplabel in all_snaps:
+                incr_src = (ds,since_snaplabel)
+            elif self.user_config['scope']['honour-origins']:
+                orig_map = origin_map.get()
+                if ds in orig_map:
+                    orig_ds, orig_snaplabel = orig_map[ds]
+                    can_incl_orig = des_graph[tuple(orig_ds.split('/'))]['role'] != 'void'
+                    if can_incl_orig or orig_snaplabel == since_snaplabel:
+                        incr_src = (orig_ds, orig_snaplabel)
+
+            prototargets[(ds,snaplabel)] = incr_src
+            if incr_src is None:
+                # there's no origin or we're ignoring the origin.
+                if since_snaplabel is not None:
+                    warn(f"Not using 'since' snapshot for {incr_src[0]}. Will do a full send.")
+                if progressive and all_snaps:
+                    # a primer is needed because zfs-send isn't otherwise able to send
+                    # a progressive full stream without the -R option. Thus the primer
+                    # is sent as a regular full stream of the very first snap, and then
+                    # send -I of the following target snap completes the progressive send.
+                    prototargets[(ds,all_snaps[0])] = None
+            else:
+                if incr_src[1] != since_snaplabel:
+                    # didn't hit 'since' yet. Keep including deeper origins til we get there
+                    assert incr_src[0] != ds
+                    targets_to_add.add(incr_src)
+
+        # if there are duplicate datasets, need to link up their snaps properly
+        for ds,targets_it in itertools.groupby(sorted(prototargets), lambda x: x[0]):
+            this_ds_targets = set(targets_it)
+            ordered_snaps = [(ds,l) for txg,l in snap_txg_order_by_ds[ds] \
+                            if (ds,l) in this_ds_targets]
+            ordered_snaps += list(this_ds_targets - set(ordered_snaps))
+            for source,derivative in zip(ordered_snaps[:-1], ordered_snaps[1:]):
+                prototargets[derivative] = source
+
+        @(lambda f: dict(f()))
+        def user_ordered_objects():
+            for i,o in reversed(list(enumerate(self.objects))):
+                if o['role_designation'] != 'include':
+                    continue
+                v = (i,o['name'])
+                for ds in o['datasets']:
+                    yield ds, v
+
+        self.targets = []
+        for snap,incr_src in prototargets.items():
+            ds, snaplabel = snap
+            hierarchy_k = ds.split('/')
+            sortkey_obj, obj_name = user_ordered_objects.get(ds, (len(self.objects)+1,None))
+            sortkey_txg = snap_txg_map.get(snap, max_snap_txg+1)
+            t = {
+                "snapshot": [ds, snaplabel],
+                "incremental_source": list(incr_src) if incr_src else None,
+                "hierarchy_k": hierarchy_k,
+                "origin_dep": bool(incr_src),
+                "hierarchy_dep": any(ds.startswith(ds2 + '/') for ds2,_ in prototargets),
+                "progressive": progressive and bool(incr_src),
+                "snap_creation": ("unknown" if snap in snapshottable_targets else "ignore"),
+                "send_size": None,
+                "send_status": "notready",
+                "rollback_option": None,
+                "sortkey": [sortkey_obj, hierarchy_k, sortkey_txg],
+                "obj_name": obj_name,
+            }
+            self.targets.append(t)
+
     @staticmethod
-    def _print_coverage_analysis(graph):
+    def _print_coverage_analysis(des_graph):
         # analyze coverage (warn for qubes/datasets neither included nor excluded)
-        excluded = []
-        included = []
+        designations = { 'include': [], 'forgo': [], 'void': [], }
         unspecified = []
         ignores = 0
-        irrelevants = 0
-        for ds,info in sorted(graph.items()):
-            if info["own_obj"] is not None:
-                match info["own_obj"][0]["role"]:
-                    case "include":
-                        included.append(ds)
-                    case "exclude":
-                        excluded.append(ds)
+        irrel_in_des = 0
+        irrel_default = 0
+        for k,node in sorted(des_graph.items()):
+            if node['des_objs']:
+                [o] = node['des_objs']
+                designations[o['role_designation']].append(node['ds'])
+            elif node['ignore']:
+                ignores += 1
+            elif node['ancestor_des_exists']:
+                irrel_in_des += 1
+            elif not node['descendant_des'] and (not node['ancestors'] or \
+                    des_graph[node['ancestors'][0]]['descendant_des']):
+                unspecified.append(node['ds'])
             else:
-                if not info["descendant_objects"]:
-                    try:
-                        pds = next(zfs_ancestors_iter(ds))
-                    except StopIteration:
-                        pass
-                    else:
-                        if not graph[pds]["descendant_objects"]:
-                            irrelevants += 1
-                            continue
-                    if info["ignore"]:
-                        ignores += 1
-                    else:
-                        unspecified.append(ds)
-                else:
-                    irrelevants += 1
+                irrel_default += 1
+
         global warning_counter
         warning_counter += len(unspecified)
 
         print("\nIncluded datasets:")
         posi = f"{colours.GREEN}+{colours.RESET}"
-        print(posi,f'\n{posi} '.join(included))
+        print(posi,f'\n{posi} '.join(designations['include']))
 
-        print("\nExcluded datasets:")
+        print("\nForgone datasets; the user has declined their inclusion, but " \
+            "they may still be included in special cases. This is also the " \
+            "default for datasets that are not included (explicitly or " \
+            "implicitly) in any group:")
         nega = f"{colours.RED}-{colours.RESET}"
-        print(nega,f'\n{nega} '.join(excluded))
+        if len(designations['forgo']):
+            print(nega,f'\n{nega} '.join(designations['forgo']))
+        else:
+            print("(none)")
 
-        print(f"\n{colours.BRIGHT_YELLOW}Warning: The following datasets have not been " \
-            "referenced. Consider explicitly including or excluding them:")
-        print('-','\n- '.join(unspecified),f"{colours.RESET}")
+        print("\nVoided (hard-excluded) datasets; these are NEVER directly " \
+            "included (but a partial send of their data blocks may occur if " \
+            "those data blocks are shared by an included dataset):")
+        nega = f"{colours.RED}-{colours.RESET}"
+        if len(designations['void']):
+            print(nega,f'\n{nega} '.join(designations['void']))
+        else:
+            print("(none)")
+
+        if len(unspecified) or options['verbose']:
+            print(f"\n{colours.BRIGHT_YELLOW}Warning: The following datasets have not been " \
+                "referenced. Consider explicitly including or excluding them:")
+            print('-','\n- '.join(unspecified),f"{colours.RESET}")
 
         print(f"\nAdditionally:\n{ignores} datasets have been automatically ignored " \
-            f"by the program's built-in rules.\n{irrelevants} datasets have " \
-            "been implicitly ignored based on the includes/excludes.")
+            f"by the program's built-in rules.\n{irrel_default} datasets have " \
+            "been implicitly ignored based on the user's designating groups.\n" \
+            f"{irrel_in_des} are not being shown because they are descendant " \
+            "datasets belonging to designations already shown above.")
 
-    def _check_on_snapshot_state(self, ds_info, reset=False):
-        if 'snap' not in ds_info:
-            raise TypeError("There is no snapshot state associated with "\
-                "that dataset. The function might have been mistakenly " \
-                "called on an excluded object.")
-        if ds_info['snap'] in ('yes','done') and not reset:
+    def _check_on_snapshot_state(self, target, reset=False):
+        if target['snap_creation'] == 'ignore' \
+            or (target['snap_creation'] in ('yes','done') and not reset):
             return
-        ds = ds_info['ds']
-        target = self.user_config['scope']['target-snapshot'][1:]
-        args = f"zfs list -H -t snapshot -o name -s createtxg -r {ds}".split()
-        snapshots = run_cmd(*args).splitlines()
-        has_snap = 'no'
-        prev_label = None
-        for snap in snapshots:
-            sds,sep,label = snap.partition('@')
-            assert sep == '@'
-            if label == target:
-                if sds == ds:
-                    has_snap = 'yes'
-                    break
-                else:
-                    has_snap = 'descendant'
-            prev_label = label
-        ds_info['snap'] = {'no':'would', 'descendant':'blocked', 'yes':'yes'}[has_snap]
-        if has_snap == 'yes':
-            if prev_label is None and self.uses_primer:
-                ds_info['snap'] = 'blocked'
-                warn(f"There are no previous snapshots to {ds}@{target} (to use " \
-                    "as a primer). This snapshot will remain blocked until it is" \
-                    "recreated with a primer.")
-            # it is not ideal when prev_label is a user-created snap that was
-            # not intended to be used as the primer. If it is very different
-            # from the target-snap we may end up sending a lot of unwanted
-            # data. But the result is acceptable in most cases, so let's not
-            # worry about it rn
-            ds_info['primer_label'] = prev_label
+        assert target['snap_creation'] in ('unknown','yes','done','would','blocked')
+        has_snap = dataset_exists('@'.join(target['snapshot']))
+        target['snap_creation'] = {False: 'would', True: 'yes'}[has_snap]
 
     def _print_snapshots_analysis(self):
         count = collections.Counter()
-        for ds_info in self.included_datasets:
-            count[ds_info['snap']] += 1
+        for target in self.targets:
+            count[target['snap_creation']] += 1
         if count['unknown'] > 0:
-            if count.total() == count['unknown']:
+            if count.total() == (count['unknown'] + count['ignore']):
                 warn("Requested snapshots analysis results but no analysis has been done")
             else:
                 warn("Refusing to print incomplete snapshot analysis results. " \
                     f"({count['unknown']} objects would be omitted)")
             return
 
-        print(f"{count['yes']+count['done']}/{count.total()} required snapshots currently exist.")
-        if self.user_config['scope']['allow-snapshot-creation']:
+        total = count.total() - count['ignore']
+        print(f"{count['yes']+count['done']}/{total} required snapshots currently exist.")
+        if self.user_config['allowed-behaviours']['snapshot-creation']:
             print(f"{count['would']} snapshots are able to be automatically created.")
         elif count['would'] + count['blocked'] > 0:
-            print("scope.allow-snapshot-creation is disabled and so snapshots " \
+            print("allowed-behaviours.snapshot-creation is disabled and so snapshots " \
                 "must be created manually.")
         if count['unknown'] > 0:
             warn(f"Incomplete snapshot analysis: {count['unknown']} objects were omitted.")
@@ -932,45 +1049,39 @@ class Config():
         obj = dict((name, getattr(self,name)) for name in self.PERSISTENT)
         return json.dumps(obj, indent=2).encode('ascii', errors='strict')
 
-    def _make_send_cmd_makers(self, mode):
-        since, progressive, target = [self.user_config['scope'][k] for k in \
-            ('since','progressive','target-snapshot')]
-        beginning = since == 'beginning'
-
-        base = ["zfs","send"]
-        mode_args = {'calc':["--dryrun","-P"], 'send':[]}[mode]
-        # primer args
-        a0 = ["-p", "{ds}@{primer_label}"]
-        # target-snapshot args
-        a1 = ["-R"]
-        if not (beginning and progressive):
-            a1 += [("-i","-I")[int(progressive)]]
-            a1 += ["{ds}" + (since,"@{primer_label}")[int(beginning)]]
-        a1 += ["{ds}"+target]
-        command_templs = [(base+mode_args+a) for a in (a0,a1)]
-
-        def make(phase, templ):
-            def f(**ctx):
-                cmd = [arg.format(**ctx) for arg in templ]
-                return cmd
-            f.phase = phase
-            f.is_primer = phase == 0
-            return f
-
-        maker_specs = list(enumerate(command_templs))[int(not self.uses_primer):]
-        return [make(i,templ) for i,templ in maker_specs]
+    @staticmethod
+    def _make_send_cmd(target, mode):
+        c = ["zfs", "send"]
+        c += {'calc':["--dryrun","-P"], 'send':[]}[mode]
+        c += ["-p"]
+        if target['incremental_source'] is not None:
+            c += [("-i","-I")[target['progressive']]]
+            c += ['@'.join(target['incremental_source'])]
+        c += ['@'.join(target['snapshot'])]
+        return c
 
     def _print_calc_result(self, query_receiver=False):
         total = 0
         skipped = 0
-        print("\nsend size:")
-        for ds_info in self.included_datasets:
-            sz = ds_info['size']
+        size_results = []
+        for target in self.targets:
+            sz = target['send_size']
             if type(sz) is int:
-                print(human_readable_bytesize(sz), ds_info['ds'])
                 total += sz
+                sk = target['sortkey']
+                name = '@'.join(target['snapshot'])
+                size_display = human_readable_bytesize(sz)
+                size_results.append( [sk, name, size_display] )
             else:
                 skipped += 1
+        if not size_results:
+            warn("calc results are empty")
+            return
+        size_results.sort()
+
+        print("\nsend size:")
+        for _,name,size in size_results:
+            print(size,name)
 
         if not skipped:
             print(human_readable_bytesize(total),"(total)")
@@ -988,7 +1099,139 @@ class Config():
                         "will fit in the available space. Until technology " \
                         "improves, that determination is left up to the user. ")
         else:
-            warn("There are uncalculated datasets. Results are incomplete.")
+            warn("There are uncalculated targets. Results are incomplete.")
+
+class TargetDependencyGraph():
+    def __init__(self, targets):
+        self.targets_map = {tuple(t['snapshot']) : t for t in targets}
+        sgs = {type_ : self._mk_subgraph(targets, type_) for type_ in ('origin','hierarchy')}
+        self.subgraphs = sgs
+        self.origin_graph = sgs['origin']
+        self.hierarchy_graph = sgs['hierarchy']
+
+    def __len__(self):
+        lens = []
+        for g in (self.origin_graph, self.hierarchy_graph):
+            self._update(g)
+            count = 0
+            for count,_ in enumerate(self._walk_subgraph(g), start=1):
+                pass
+            lens.append(count)
+        assert lens[0] == lens[1]
+        return lens[0]
+
+    def sendables(self):
+        def keys_of(g):
+            self._update(g)
+            return {tuple(t['snapshot']) for t,c in g}
+        shared_keys = keys_of(self.origin_graph) & keys_of(self.hierarchy_graph)
+        if len(shared_keys) == 0 and len(self) != 0:
+            if options['debug']:
+                self._print_subgraph(self.origin_graph, "origin")
+                print("")
+                self._print_subgraph(self.hierarchy_graph, "hierarchy")
+            raise RuntimeError("Graph iteration has deadlocked")
+        r = [self.targets_map[k] for k in shared_keys]
+        r.sort(key=(lambda t: t['sortkey']))
+        return r
+
+    def sendables_iter(self, mode):
+        def by_status(s):
+            return filter((lambda t: t['send_status'] == s), self.sendables())
+
+        def depth():
+            while True:
+                try:
+                    yield next(iter(by_status('ready')))
+                except StopIteration:
+                    return
+
+        def breadth():
+            while True:
+                row = list(by_status('ready'))
+                if not row:
+                    return
+                yield from row
+
+        modes = {
+            "depth": depth,
+            "breadth": breadth,
+            "interrupted": (lambda: by_status('interrupted')),
+            "one": (lambda: self.sendables()[:1]),
+        }
+
+        return iter(modes[mode]())
+
+    @staticmethod
+    def _mk_subgraph(targets, type_):
+        g = [] # graph with nodes of (target,[children...])
+        to_add = []
+        for t in targets:
+            # create all nodes
+            # nodes without dependency are placed directly in g as root nodes
+            {True: to_add, False: g}[t[type_+"_dep"]].append((t,[]))
+
+        # organize to_add nodes
+        if type_ == 'hierarchy':
+            for depth in itertools.count(1):
+                if not to_add:
+                    break
+                at_depth = [n for n in to_add if len(n[0]['hierarchy_k']) == depth]
+                for adding_n in at_depth:
+                    to_add.remove(adding_n)
+                    adding_k = adding_n[0]['hierarchy_k']
+                    match_len = 0
+                    match_n = None
+                    for parent_n in TargetDependencyGraph._walk_subgraph(g):
+                        parent_k = parent_n[0]['hierarchy_k']
+                        cmp_len = min(len(parent_k), len(adding_k)-1)
+                        txg_bias = int(match_n is not None and \
+                                    parent_n[0]['sortkey'][-1] < match_n[0]['sortkey'][-1])
+                        if parent_k == adding_k[:cmp_len] and (cmp_len + txg_bias) > match_len:
+                            match_len = cmp_len
+                            match_n = parent_n
+                    match_n[1].append(adding_n)
+        elif type_ == 'origin':
+            for _ in range(len(to_add)+1):
+                for n in to_add.copy():
+                    for orig_n in TargetDependencyGraph._walk_subgraph(g):
+                        if orig_n[0]['snapshot'] == n[0]['incremental_source']:
+                            orig_n[1].append(n)
+                            to_add.remove(n)
+                            break
+                if not to_add:
+                    break
+            else:
+                raise Exception("incremental source not found")
+        return g
+
+    @staticmethod
+    def _walk_subgraph(g):
+        for n in g:
+            yield n
+            yield from TargetDependencyGraph._walk_subgraph(n[1])
+
+    @staticmethod
+    def _update(g):
+        for i,(t,c) in reversed(list(enumerate(g))):
+            if t['send_status'] not in ('ready','interrupted'):
+                TargetDependencyGraph._update(c)
+                g[i:i+1] = c
+
+    @staticmethod
+    def _print_subgraph(g, name="subgraph"):
+        root_c = [{"snapshot":(name,)},g]
+        path = [[root_c,0]]
+        while path:
+            (t,c),ci = n = path[-1]
+            if not ci:
+                indent = ' ' * (4 * (len(path) - 1))
+                print(indent, '@'.join(t['snapshot']), sep='')
+            try:
+                path.append([c[ci],0])
+                n[1] += 1
+            except IndexError:
+                path.pop()
 
 class Receiver():
     OUTPUT_ARGS = ["--pass-io", "--no-colour-output",
@@ -1079,11 +1322,16 @@ class Receiver():
             metrics = self.new_transfer_metrics()
         metrics_ref_time = float(metrics['secs_elapsed'])
         enter_time = time.time()
+        progress_cb_cooldown = 1.0
 
         def update_metrics(sz=0):
+            nonlocal progress_cb_cooldown
+            t = time.time()
             metrics['bytes_sent'] += sz
-            metrics['secs_elapsed'] = (time.time() - enter_time) + metrics_ref_time
-            progress_cb(metrics)
+            metrics['secs_elapsed'] = (t - enter_time) + metrics_ref_time
+            if t >= progress_cb_cooldown:
+                progress_cb_cooldown = t + 0.05
+                progress_cb(metrics)
             return metrics
 
         async def metrics_update_on_interval():
@@ -1161,12 +1409,18 @@ class ProgressBar():
 
         content = self.render(**kwargs)
         self.backspace()
-        print(content, end='\r', flush=True)
+        try:
+            print(content, end='\r', flush=True)
+        except BlockingIOError:
+            time.sleep(0.2)
+            if options['debug']:
+                msg = "ProgressBar.print_cb: print call in threw BlockingIOError"
+                warn(msg, prefix="Debug: ", once=True)
         self.last_content_len = len(content)
 
     def render(self, bytes_sent, secs_elapsed):
         ratio = bytes_sent / self.total_bytes
-        percent = (str(round(ratio * 100, 1)) + "%").rjust(6)
+        percent = (str(round(ratio * 100, 1)) + "%").rjust(7)
         bytes_sent_str = self.bytes_str(bytes_sent)
         parts = [
             percent+" ",
@@ -1198,13 +1452,6 @@ class ProgressBar():
     def _update_env(self, now=None):
         self.term_width = os.get_terminal_size().columns
         self.last_update_env = now or time.time()
-
-def zfs_ancestors_iter(ds):
-    while True:
-        ds,sep,_ = ds.rpartition('/')
-        if not sep:
-            return
-        yield ds
 
 def qubesd_query(call, dest, arg=None):
     # usage reference: https://www.qubes-os.org/doc/admin-api/
@@ -1244,17 +1491,43 @@ class LazySystemQuery():
                 r[p] = pinfo
         return r
 
+    @staticmethod
+    @(lambda f: compose(f, dict))
+    def post_origin_map(raw):
+        for l in raw.splitlines():
+            if '@' in l:
+                k,v = l.split()
+                yield k, tuple(v.split('@'))
+
+    @staticmethod
+    @(lambda f: compose(f, list))
+    def post_snap_txg(raw):
+        for l in raw.splitlines():
+            if '@' in l:
+                a,b = l.split()
+                yield int(a), tuple(b.split('@'))
+
 qube_list = LazySystemQuery(["qvm-ls","--raw-list"], (lambda x: set(str.split(x))))
 dataset_list = LazySystemQuery("zfs list -H -o name".split(), (lambda x: set(str.splitlines(x))))
 qubes_pools_info = LazySystemQuery([], cmd=LazySystemQuery.get_zfs_qubes_pools_info)
+origin_map = LazySystemQuery("zfs list -H -o name,origin".split(), LazySystemQuery.post_origin_map)
+snap_txg_order = LazySystemQuery(
+    "zfs list -H -t snapshot -o createtxg,name -s createtxg -s name".split(),
+    LazySystemQuery.post_snap_txg
+)
 
-def contained_zvols_attached_to_any_domain(dataset):
-    """The specified dataset and all of its descendants are are checked
-    to see if they are attached to any qubes, and if so, the return value
-    is the set of those datasets which are attached. If none of the datasets
-    are attached to a qube, an empty set is returned. Volumes permanently
-    attached to a NON-running qube don't count as attached for this-- at
-    least, they shouldn't, and if they do, it's a bug (I haven't tested)."""
+def dataset_exists(ds):
+    args = ["zfs", "list", ds]
+    track_commandline(args)
+    null = subprocess.DEVNULL
+    p = subprocess.run(args, check=False, stdout=null, stderr=null)
+    return p.returncode == 0
+
+def get_zvols_attached_to_any_qube():
+    """Returns the set of all zvols that are currently attached to any qube.
+    Volumes permanently attached to a NON-running qube don't count as attached
+    for this-- at least, they shouldn't, and if they do, it's a bug (I haven't
+    tested)."""
     devnodes = set()
     for dom in qapp.domains:
         get_attached_blockdevs = \
@@ -1268,10 +1541,7 @@ def contained_zvols_attached_to_any_domain(dataset):
             all_attached_zvols.add(run_cmd("/lib/udev/zvol_id",devnode).strip())
         except subprocess.CalledProcessError:
             pass
-
-    args = f"zfs list -H -o name -t volume -r {dataset}".split()
-    contained_zvols = set(run_cmd(*args).split())
-    return contained_zvols & all_attached_zvols
+    return all_attached_zvols
 
 class SubcommandsList():
     def __init__(self):
@@ -1290,13 +1560,20 @@ class SubcommandsList():
                 yield cmd
 
     def add(self, f, tags):
+        def with_config():
+            config = Config.load(options["config_name"])
+            try:
+                f(config)
+            finally:
+                config.save()
         name = f.__name__.lstrip('_')
+        func = with_config if ('with_config' in tags) else f
         spec = {
             "cmd_id": len(self.list_),
             "name": name,
             "help": f.__doc__,
             "tags": set(tags),
-            "func": f,
+            "func": func,
         }
         assert name not in self.by_name
         self.list_.append(spec)
@@ -1331,11 +1608,13 @@ def get_cli_options():
 
     p = argparse.ArgumentParser(prog=f"{apparent_command_name} {cmd['name']}")
     p.add_argument('-v', dest="verbose", action="store_true")
-    if 'config_name' in cmd['tags']:
+    if 'with_config' in cmd['tags'] or 'config_name' in cmd['tags']:
         p.add_argument("config_name")
     if 'send-opts' in cmd['tags']:
         p.add_argument('-f', dest="allow-rollback", action="store_true")
         p.add_argument('-F', dest="zfs-overwrite", action="store_true")
+    if 'depgraph' in cmd['tags']:
+        p.add_argument('-i','--initial', dest="depgraph-initial", action="store_true")
     if 'file1' in cmd['tags']:
         p.add_argument("file1")
 
@@ -1360,7 +1639,7 @@ def _check():
     The user should study the output carefully to catch any configuration
     mistakes, and recheck if revisions are made.
     """
-    config = Config.import_(options["file1"])
+    config = Config.import_file(options["file1"])
     config.print_import_analysis()
     if config.name in Config.all_config_names():
         warn(f"A configuration named {config.name} already exists, " \
@@ -1384,47 +1663,35 @@ def _import():
             "need to create the directory"
         raise MyError(e, msg, error_code='fatal')
 
-    config = Config.import_(options["file1"])
+    config = Config.import_file(options["file1"])
     if config.name in Config.all_config_names():
         msg = "Refusing to overwrite configuration of same name"
         raise MyError(msg, error_code='fatal')
     config.save()
     print("Imported "+config.name)
 
-@subcmd('backupcmd', 'config_name')
-def _snapshot():
+@subcmd('backupcmd', 'with_config')
+def _snapshot(config):
     """\
     Creates the configuration's target snapshot.
     """
-    config = Config.load(options["config_name"])
-    try:
-        config.do_snapshots()
-    finally:
-        config.save()
+    config.do_snapshots()
 
-@subcmd('backupcmd', 'config_name')
-def _calc():
+@subcmd('backupcmd', 'with_config')
+def _calc(config):
     """\
     Calculates size of the eventual send, and performs some final checks before
     the send.
     """
-    config = Config.load(options["config_name"])
-    try:
-        config.calculate_send()
-    finally:
-        config.save()
+    config.calculate_send()
 
-@subcmd('backupcmd', 'config_name', 'send-opts')
-def _send():
+@subcmd('backupcmd', 'with_config', 'send-opts')
+def _send(config):
     """\
     Copies the included set to the receiver qube. If it succeeds, the backup
     process is complete.
     """
-    config = Config.load(options["config_name"])
-    try:
-        config.do_send()
-    finally:
-        config.save()
+    config.do_send()
 
 @subcmd('infocmd')
 def _list():
@@ -1498,6 +1765,30 @@ def _help():
         print()
 
     options['verbose'] = False
+
+@subcmd('config_name')
+def _reimport():
+    old_config = Config.load(options['config_name'])
+    new_config = Config.import_(old_config.raw_user_config)
+    new_config.save()
+    print(f"Reimported '{new_config.name}' and its old savestate has been overwritten.")
+
+@subcmd('with_config', 'send-opts')
+def _send_one(config):
+    """\
+    Like send, but exits after sending one target.
+    """
+    config.do_send(phases=('one',))
+
+@subcmd('config_name','depgraph')
+def _depgraph():
+    config = Config.load(options['config_name'])
+    graph = TargetDependencyGraph(config.targets)
+    for name,sg in graph.subgraphs.items():
+        print()
+        if not options['depgraph-initial']:
+            graph._update(sg)
+        graph._print_subgraph(sg, name)
 
 @subcmd()
 def _dev_stream_test():
