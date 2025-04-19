@@ -942,9 +942,9 @@ class Config():
             sortkey_txg = snap_txg_map.get(snap, max_snap_txg+1)
             t = {
                 "snapshot": [ds, snaplabel],
-                "incremental_source": list(incr_src) if incr_src else None,
+                "incremental_source": (incr_src and list(incr_src)),
                 "hierarchy_k": hierarchy_k,
-                "origin_dep": bool(incr_src),
+                "origin_dep": (bool(incr_src) and incr_src[1] != since_snaplabel),
                 "hierarchy_dep": any(ds.startswith(ds2 + '/') for ds2,_ in prototargets),
                 "progressive": progressive and bool(incr_src),
                 "snap_creation": ("unknown" if snap in snapshottable_targets else "ignore"),
