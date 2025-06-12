@@ -27,7 +27,7 @@ options = {
     "debug": True,
 }
 
-VERSION = 0
+VERSION = "0.1.1"
 PROGRAM_DESCRIPTION = "a backups and snapshots tool for QubesOS+ZFS systems"
 ERROR_CODES = {
     "input": 1,
@@ -850,17 +850,18 @@ class Config():
             raise errs
 
         for node in graph.values():
+            node['ancestor_des_exists'] = False
             relevant_nodes = [node] + [graph[a] for a in node['ancestors']]
             for other_n in relevant_nodes:
                 if other_n['des_objs']:
                     [other_obj] = other_n['des_objs']
-                    node['ancestor_des_exists'] = True
+                    if other_n is not node:
+                        node['ancestor_des_exists'] = True
                     if node['ds'] in other_obj['datasets']:
                         node['role_obj'] = other_obj
                         node['role'] = other_obj['role_designation']
                         break
             else:
-                node['ancestor_des_exists'] = False
                 node['role_obj'] = None
                 node['role'] = 'forgo'
         return graph
@@ -909,7 +910,7 @@ class Config():
             if incr_src is None:
                 # there's no origin or we're ignoring the origin.
                 if since_snaplabel is not None:
-                    warn(f"Not using 'since' snapshot for {incr_src[0]}. Will do a full send.")
+                    warn(f"Not using 'since' snapshot for {ds}. Will do a full send.")
                 if progressive and all_snaps:
                     # a primer is needed because zfs-send isn't otherwise able to send
                     # a progressive full stream without the -R option. Thus the primer
@@ -1420,7 +1421,7 @@ class ProgressBar():
         except BlockingIOError:
             time.sleep(0.2)
             if options['debug']:
-                msg = "ProgressBar.print_cb: print call in threw BlockingIOError"
+                msg = "ProgressBar.print_cb: print call threw BlockingIOError"
                 warn(msg, prefix="Debug: ", once=True)
         self.last_content_len = len(content)
 
