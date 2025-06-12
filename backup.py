@@ -432,22 +432,12 @@ class Config():
             if target['snap_creation'] != 'would':
                 continue
             ds = target['snapshot'][0]
-            obj = self.objects_by_name.get(target['obj_name'], None)
-            if obj and obj['type'] == 'qubes':
-                args = f"qvm-check -q --running {obj['member_name']}".split()
-                track_commandline(args)
-                exitcode = subprocess.run(args).returncode
-                if exitcode == 0:
-                    msg = f"Qube {obj['member_name']} is running. Deferring snapshot creation."
-                    warn(msg, once=True)
-                    deferred += 1
-                    continue
-            else:
-                is_attached = ds in get_zvols_attached_to_any_qube()
-                if is_attached:
-                    warn(f"Volume {ds} is attached to a qube. Deferring snapshot creation.")
-                    deferred += 1
-                    continue
+            attachment = get_zvols_attached_to_any_qube().get(ds)
+            if attachment and attachment['rw']:
+                hosts = ", ".join(attachment['hosts'])
+                warn(f"Volume {ds} is in use by {hosts}. Deferring snapshot creation.")
+                deferred += 1
+                continue
 
             # yes, snap
             snap_name = '@'.join(target['snapshot'])
@@ -1539,24 +1529,47 @@ def dataset_exists(ds):
     p = subprocess.run(args, check=False, stdout=null, stderr=null)
     return p.returncode == 0
 
+diskpath_to_dataset_cache = {}
+def diskpath_to_dataset(diskpath):
+    if not diskpath.startswith("/dev/"):
+        return None
+    try:
+        return diskpath_to_dataset_cache[diskpath]
+    except KeyError:
+        pass
+    real_diskpath = os.path.realpath(diskpath)
+    if not os.path.exists(real_diskpath):
+        return None
+    try:
+        zvol = run_cmd("/lib/udev/zvol_id", real_diskpath).strip()
+    except subprocess.CalledProcessError:
+        zvol = None
+
+    diskpath_to_dataset_cache[diskpath] = zvol
+    return zvol
+
 def get_zvols_attached_to_any_qube():
-    """Returns the set of all zvols that are currently attached to any qube.
-    Volumes permanently attached to a NON-running qube don't count as attached
-    for this-- at least, they shouldn't, and if they do, it's a bug (I haven't
-    tested)."""
-    devnodes = set()
-    for dom in qapp.domains:
-        get_attached_blockdevs = \
-            getattr(dom.devices['block'], "get_attached_devices", None) or \
-            dom.devices['block'].attached
-        for blk in get_attached_blockdevs():
-            devnodes.add(blk.data['device_node'])
-    all_attached_zvols = set()
-    for devnode in devnodes:
-        try:
-            all_attached_zvols.add(run_cmd("/lib/udev/zvol_id",devnode).strip())
-        except subprocess.CalledProcessError:
-            pass
+    """\
+    Get info on all zvols that are currently attached to any running qube.
+    Return value is a mapping where the keys are all the attached (in-use) zvols.
+    """
+    all_attached_zvols = {}
+    domains_info_raw = run_cmd("/usr/sbin/xl", "list", "-l")
+    domains_info = json.loads(domains_info_raw)
+    for dom in domains_info:
+        id_ = dom['domid']
+        name = dom['config']['c_info']['name']
+        if (id_ == 0) != (name == "Domain-0"):
+            raise RuntimeError(f"is this dom0 or isn't it? (id={id_}, name={name})")
+        if id_ == 0:
+            continue
+        for disk_info in dom['config'].get('disks', []):
+            zvol = diskpath_to_dataset(disk_info['pdev_path'])
+            if zvol is not None:
+                zvol_info = all_attached_zvols.setdefault(zvol, {"rw":False, "hosts":[]})
+                zvol_info['hosts'].append(name)
+                if bool(disk_info.get('readwrite')):
+                    zvol_info['rw'] = True
     return all_attached_zvols
 
 class SubcommandsList():
